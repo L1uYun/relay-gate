@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay-gate"
+version = "0.1.0"
+description = "NewAPI Relay Gate management CLI"
+requires-python = ">=3.11"
+dependencies = ["requests"]
+
+[project.scripts]
+relay-gate = "scripts.relay_gate:main"
+
+[tool.setuptools]
+packages = ["scripts"]
+
+[tool.setuptools.package-dir]
+scripts = "scripts"

@@ -1,0 +1,3269 @@
+#!/usr/bin/env python
+"""Manage the user's personal NewAPI gateway.
+
+Secrets stay in Sigil. Bare credential names resolve from Sigil; use explicit
+env: / process-env: / sigil-env: prefixes when the source must differ. This
+script never prints full admin tokens, NewAPI caller tokens, or upstream API
+keys.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import requests
+
+
+DEFAULT_BASE_URL = "https://newapi.l1uyun.one:8080"
+DEFAULT_ADMIN_TOKEN_CRED = "l1uyun-newapi-admin-access-token"
+DEFAULT_GENERAL_TOKEN_CRED = "l1uyun-newapi-general-api-key"
+DEFAULT_USER_ID = "1"
+DEFAULT_CODEX_CATALOG_PATH = Path.home() / ".codex" / "cc-switch-model-catalog.json"
+DEFAULT_CODEX_MODELS_CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
+SIGIL = Path(r"D:\AgentWork\tools\sigil\src\sigil.py")
+RESPONSES_BRIDGE_OPTION_KEY = "global.responses_to_chat_completions_policy"
+CHANNEL_STATUS_ENABLED = 1
+CHANNEL_STATUS_MANUAL_DISABLED = 2
+CHANNEL_STATUS_AUTO_DISABLED = 3
+QUOTA_HOLD_REASON = "quota_exhausted_manual_hold"
+AUTO_PROBE_MODELS = {"auto", "buddy-auto"}
+SOFT_DISABLE_KEYWORDS = "\n".join(
+    [
+        "This organization has been disabled.",
+        "Permission denied",
+        "The security token included in the request is invalid",
+        "Operation not allowed",
+        "Your account is not authorized",
+    ]
+)
+
+CHANNEL_TYPES: dict[str, int] = {
+    "openai": 1,
+    "anthropic": 14,
+    "openrouter": 20,
+    "gemini": 24,
+    "siliconflow": 40,
+    "deepseek": 43,
+    "custom": 8,
+}
+
+DEFAULT_MODELS = "gpt-5.5,gpt-5.4"
+
+
+class CliError(RuntimeError):
+    pass
+
+
+class ContextMeta:
+    """Context-window/max-tokens resolution from OpenRouter + local overrides.
+
+    Single authority for model context metadata. Consumed by codex-catalog sync
+    (context_window field) and agent-models sync (pi contextWindow/maxTokens,
+    codebuddy context_window/max_tokens). OpenRouter /api/v1/models is the
+    primary source; UPSTREAM_OVERRIDES encode API-level rated limits from resold
+    channels (e.g. xfyun glm-5.2=500K rated limit); CODEX_PRODUCT_OVERRIDES encode
+    Codex Desktop soft compaction triggers, set lower than UPSTREAM_OVERRIDES to
+    give async compaction headroom before the upstream rejects the request
+    (karma #147: Codex Desktop does not hard-truncate at context_window).
+    """
+
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
+    CACHE_PATH = Path.home() / ".servitor" / "model_cache" / "openrouter_models.json"
+    CACHE_TTL = 3600 * 6  # 6 hours
+
+    OR_MAP = {
+        "Kimi-K2.6": "moonshotai/kimi-k2.6",
+        "GLM-5.1": "z-ai/glm-5.1",
+        "MiMo-V2.5-Pro": "xiaomi/mimo-v2.5-pro",
+        "MiMo-V2.5": "xiaomi/mimo-v2.5",
+        "GLM-5-Turbo": "z-ai/glm-5-turbo",
+        "GLM-5V-Turbo": "z-ai/glm-5v-turbo",
+        "GLM-5": "z-ai/glm-5",
+        "GLM-4.7": "z-ai/glm-4.7",
+        "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
+        "claude-fable-5": "anthropic/claude-fable-5",
+        "claude-haiku-4-5": "anthropic/claude-haiku-4.5",
+        "claude-opus-4-6": "anthropic/claude-opus-4.6",
+        "claude-opus-4-7": "anthropic/claude-opus-4.7",
+        "claude-opus-4-8": "anthropic/claude-opus-4.8",
+        "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
+        "claude-sonnet-5": "anthropic/claude-sonnet-5",
+        "glm-5.2": "z-ai/glm-5.2",
+        "gpt-5.4": "openai/gpt-5.4",
+        "gpt-5.4-mini": "openai/gpt-5.4-mini",
+        "gpt-5.5": "openai/gpt-5.5",
+        "grok-4.3": "x-ai/grok-4.3",
+        "kimi-for-coding": "moonshotai/kimi-k2.6",
+        "step-3.7-flash": "stepfun/step-3.7-flash",
+    }
+
+    SUFFIXES = ["-think-search", "-think", "-search", "-console", "-fast", "-high", "-low", "-medium"]
+
+    UPSTREAM_OVERRIDES = {
+        "glm-5.2": 500_000,
+        "gpt-5.5": 256_000,
+        "gpt-5.5-openai-compact": 256_000,
+    }
+
+    # Codex Desktop uses context_window as an ASYNC compaction trigger, not a hard
+    # truncation limit. Context keeps growing between trigger and completion.
+    # Set lower than UPSTREAM_OVERRIDES to give compaction headroom before the
+    # upstream hard limit rejects the request (karma #147).
+    CODEX_PRODUCT_OVERRIDES: dict[str, int] = {
+        "glm-5.2": 400_000,
+    }
+
+    MAX_OUT_FALLBACK = {
+        "xiaomi/mimo-v2.5": 131_072,
+        "x-ai/grok-4.3": 128_000,
+    }
+
+    NO_OR_MATCH = {"MiMo-V2-Flash"}
+
+    _cache: dict[str, dict] | None = None
+
+    @classmethod
+    def resolve_or_id(cls, model_id: str) -> str | None:
+        if model_id in cls.NO_OR_MATCH:
+            return None
+        if model_id in cls.OR_MAP:
+            return cls.OR_MAP[model_id]
+        for suf in cls.SUFFIXES:
+            if model_id.endswith(suf):
+                base = model_id[:-len(suf)]
+                if base in cls.OR_MAP:
+                    return cls.OR_MAP[base]
+        return None
+
+    @classmethod
+    def _fetch_openrouter(cls) -> dict[str, dict]:
+        if cls._cache is not None:
+            return cls._cache
+        try:
+            if cls.CACHE_PATH.exists():
+                age = time.time() - cls.CACHE_PATH.stat().st_mtime
+                if age < cls.CACHE_TTL:
+                    data = json.loads(cls.CACHE_PATH.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and data:
+                        cls._cache = data
+                        return cls._cache
+        except Exception:
+            pass
+        try:
+            import urllib.request
+            req = urllib.request.Request(cls.OPENROUTER_URL, headers={"User-Agent": "relay-gate/context-meta"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            models = {}
+            for m in raw.get("data", []):
+                mid = m.get("id")
+                if mid:
+                    models[mid] = m
+            cls._cache = models
+            try:
+                cls.CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                cls.CACHE_PATH.write_text(json.dumps(models, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+            return cls._cache
+        except Exception:
+            cls._cache = {}
+            return cls._cache
+
+    @classmethod
+    def resolve(cls, model_id: str, *, for_codex: bool = False) -> tuple[int | None, int | None]:
+        or_id = cls.resolve_or_id(model_id)
+        or_model = cls._fetch_openrouter().get(or_id) if or_id else None
+        ctx = or_model.get("context_length") if or_model else None
+        tp = (or_model.get("top_provider") or {}) if or_model else {}
+        max_out = tp.get("max_completion_tokens")
+        if not max_out and or_id and or_id in cls.MAX_OUT_FALLBACK:
+            max_out = cls.MAX_OUT_FALLBACK[or_id]
+        if model_id in cls.UPSTREAM_OVERRIDES:
+            ctx = cls.UPSTREAM_OVERRIDES[model_id]
+        if for_codex and model_id in cls.CODEX_PRODUCT_OVERRIDES:
+            ctx = cls.CODEX_PRODUCT_OVERRIDES[model_id]
+        return ctx, max_out
+
+
+def run_sigil(args: list[str], *, input_text: str | None = None) -> str:
+    cmd = [sys.executable, str(SIGIL), *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CliError(
+            "Sigil credential command timed out; check SIGIL_PASSPHRASE or pass credentials through an explicit env source"
+        ) from exc
+    if proc.returncode != 0:
+        raise CliError(proc.stderr.strip() or proc.stdout.strip())
+    return proc.stdout.strip()
+
+
+def reveal_credential(name: str) -> str:
+    if name.startswith("env:") or name.startswith("process-env:"):
+        env_name = name.split(":", 1)[1]
+        value = os.environ.get(env_name)
+        if not value:
+            raise CliError(f"process environment variable not found: {env_name}")
+        return value.strip()
+    if name.startswith("sigil-env:"):
+        return reveal_env_secret(name.split(":", 1)[1])
+    return run_sigil(["secret", "show", name, "--reveal"]).strip()
+
+
+def reveal_env_secret(name: str) -> str:
+    return run_sigil(["env", "show", name, "--reveal"]).strip()
+
+
+def reveal_credential_or_env(name: str) -> str:
+    try:
+        return reveal_credential(name)
+    except CliError:
+        return reveal_env_secret(name)
+
+
+def store_credential(name: str, secret: str, *, kind: str, note: str) -> None:
+    run_sigil(
+        ["secret", "set", name, "--kind", kind, "--note", note, "--secret-stdin"],
+        input_text=secret,
+    )
+
+
+def redact(value: str | None, keep: int = 4) -> str:
+    if not value:
+        return ""
+    if len(value) <= keep * 2:
+        return "*" * len(value)
+    return f"{value[:keep]}...{value[-keep:]}"
+
+
+def secret_fingerprint(value: str | None) -> str | None:
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def effective_apply(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
+
+
+def emit(data: Any, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    if isinstance(data, str):
+        print(data)
+        return
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def emit_and_optionally_log(data: Any, as_json: bool, json_log: str = "") -> None:
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    if json_log:
+        Path(json_log).write_text(text + "\n", encoding="utf-8")
+    if as_json:
+        print(text)
+        return
+    print(text)
+
+
+def api_request(
+    args: argparse.Namespace,
+    method: str,
+    path: str,
+    *,
+    json_body: Any | None = None,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    token = reveal_credential(args.admin_token_cred)
+    headers = {
+        "Authorization": token,
+        "New-Api-User": str(args.user_id),
+        "Content-Type": "application/json",
+    }
+    url = args.base_url.rstrip("/") + path
+    proxies = None
+    proxy_url = getattr(args, "proxy_url", "") or ""
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+    resp = requests.request(
+        method,
+        url,
+        headers=headers,
+        json=json_body,
+        params=params,
+        timeout=args.timeout,
+        proxies=proxies,
+    )
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise CliError(f"non-JSON response from {path}: HTTP {resp.status_code}") from exc
+    if resp.status_code >= 400:
+        raise CliError(f"HTTP {resp.status_code} from {path}: {data}")
+    if data.get("success") is False:
+        raise CliError(f"NewAPI error from {path}: {data.get('message')}")
+    return data
+
+
+def caller_api_request(
+    args: argparse.Namespace,
+    method: str,
+    path: str,
+    *,
+    json_body: Any | None = None,
+) -> Any:
+    token = reveal_credential(args.caller_token_cred)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    url = args.base_url.rstrip("/") + path
+    proxies = None
+    proxy_url = getattr(args, "proxy_url", "") or ""
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+    resp = requests.request(
+        method,
+        url,
+        headers=headers,
+        json=json_body,
+        timeout=args.timeout,
+        proxies=proxies,
+    )
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise CliError(f"non-JSON response from {path}: HTTP {resp.status_code}") from exc
+    if resp.status_code >= 400:
+        raise CliError(f"HTTP {resp.status_code} from {path}: {data}")
+    return data
+
+def sse_probe_via_relay(
+    args: argparse.Namespace,
+    *,
+    model: str,
+    prompt: str = "ping",
+    max_tokens: int = 16,
+    extra_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Send a real streaming chat completion through the NewAPI gateway and
+    summarize the SSE result.
+
+    This bypasses NewAPI's internal /api/channel/test/{id}, which assumes the
+    upstream returns non-stream JSON. Many real upstreams (e.g. type=8
+    passthrough channels like volcengine ark or buddy/codebuddy) only return
+    text/event-stream and embed business errors inside SSE frames, so the
+    native test endpoint reports false negatives.
+
+    Returns a dict with: ok, http_status, latency_ms, first_token_ms,
+    upstream_model, finish_reason, content_preview, prompt_tokens,
+    completion_tokens, error.
+    """
+
+    token = reveal_credential(args.caller_token_cred)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if extra_body:
+        body.update(extra_body)
+
+    url = args.base_url.rstrip("/") + "/v1/chat/completions"
+    proxies = None
+    proxy_url = getattr(args, "proxy_url", "") or ""
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+    started = time.monotonic()
+    first_token_ms: float | None = None
+    content_chunks: list[str] = []
+    upstream_model = ""
+    finish_reason = ""
+    sse_error: dict[str, Any] | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=args.timeout,
+            proxies=proxies,
+            stream=True,
+        )
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "http_status": None,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": f"network: {exc}",
+            "via": "relay",
+            "model": model,
+        }
+
+    http_status = resp.status_code
+    if http_status >= 400:
+        try:
+            err_body = resp.text[:400]
+        finally:
+            resp.close()
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": f"HTTP {http_status}: {err_body}",
+            "via": "relay",
+            "model": model,
+        }
+
+    try:
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].lstrip()
+            if payload == "[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("error"):
+                err = obj["error"]
+                if isinstance(err, dict):
+                    sse_error = err
+                else:
+                    sse_error = {"message": str(err)}
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if not upstream_model and obj.get("model"):
+                upstream_model = str(obj.get("model"))
+            choices = obj.get("choices") or []
+            if choices and isinstance(choices, list):
+                ch0 = choices[0] or {}
+                delta = ch0.get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    if first_token_ms is None:
+                        first_token_ms = (time.monotonic() - started) * 1000.0
+                    content_chunks.append(str(piece))
+                fr = ch0.get("finish_reason")
+                if fr:
+                    finish_reason = str(fr)
+            usage = obj.get("usage") or {}
+            if isinstance(usage, dict):
+                if usage.get("prompt_tokens") is not None:
+                    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                if usage.get("completion_tokens") is not None:
+                    completion_tokens = int(usage.get("completion_tokens") or 0)
+    finally:
+        resp.close()
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    content = "".join(content_chunks)
+
+    if sse_error:
+        return {
+            "ok": False,
+            "http_status": http_status,
+            "latency_ms": latency_ms,
+            "first_token_ms": int(first_token_ms) if first_token_ms is not None else None,
+            "upstream_model": upstream_model or None,
+            "error": preview_text(sse_error.get("message") or sse_error.get("msg") or sse_error, limit=240),
+            "sse_error_code": sse_error.get("code") if isinstance(sse_error, dict) else None,
+            "via": "relay",
+            "model": model,
+        }
+
+    ok = bool(finish_reason) and bool(content)
+    return {
+        "ok": ok,
+        "http_status": http_status,
+        "latency_ms": latency_ms,
+        "first_token_ms": int(first_token_ms) if first_token_ms is not None else None,
+        "upstream_model": upstream_model or None,
+        "finish_reason": finish_reason or None,
+        "content_preview": preview_text(content, limit=120),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "via": "relay",
+        "model": model,
+    }
+
+
+
+def normalize_base_url(value: str, *, strip_v1: bool) -> str:
+    url = value.strip().rstrip("/")
+    if strip_v1 and url.endswith("/v1"):
+        url = url[:-3].rstrip("/")
+    return url
+
+
+def split_list(value: Any, default: str = "") -> list[str]:
+    raw = value if value not in (None, "") else default
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return [item.strip() for item in str(raw).replace("\n", ",").split(",") if item.strip()]
+
+
+def coerce_channel_type(value: Any) -> int:
+    if value in (None, ""):
+        return CHANNEL_TYPES["openai"]
+    if isinstance(value, int):
+        return value
+    value_s = str(value).strip().lower()
+    if value_s.isdigit():
+        return int(value_s)
+    if value_s not in CHANNEL_TYPES:
+        raise CliError(f"unknown channel type: {value}")
+    return CHANNEL_TYPES[value_s]
+
+
+def default_channel_setting() -> str:
+    return json.dumps(
+        {
+            "force_format": False,
+            "thinking_to_content": False,
+            "proxy": "",
+            "pass_through_body_enabled": False,
+            "system_prompt": "",
+            "system_prompt_override": False,
+        },
+        ensure_ascii=False,
+    )
+
+
+def default_channel_settings(channel_type: int) -> str:
+    if channel_type == 1:
+        return json.dumps(
+            {
+                "allow_service_tier": False,
+                "disable_store": False,
+                "allow_safety_identifier": False,
+                "allow_include_obfuscation": False,
+                "allow_inference_geo": False,
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps({}, ensure_ascii=False)
+
+
+def build_channel_create_payload(args: argparse.Namespace, key: str) -> dict[str, Any]:
+    models = ",".join(split_list(args.models))
+    if not models:
+        raise CliError("provide at least one model")
+    channel_type = coerce_channel_type(args.type)
+    model_list = split_list(args.models)
+    channel = {
+        "name": args.name,
+        "type": channel_type,
+        "base_url": normalize_base_url(args.base_url_value, strip_v1=not args.keep_v1),
+        "key": key,
+        "models": models,
+        "group": ",".join(split_list(args.group)),
+        "model_mapping": args.model_mapping or None,
+        "priority": args.priority,
+        "weight": args.weight,
+        "test_model": args.test_model or model_list[0],
+        "auto_ban": args.auto_ban,
+        "status": args.status,
+        "tag": args.tag or None,
+        "remark": args.remark or "",
+        "setting": default_channel_setting(),
+        "settings": default_channel_settings(channel_type),
+    }
+    return {
+        "mode": "single",
+        "multi_key_mode": "random",
+        "batch_add_set_key_prefix_2_name": False,
+        "channel": channel,
+    }
+
+
+def _routing_hint_for_create(channel: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(channel.get("base_url") or "")
+    hint: dict[str, Any] = {"base_url": base_url}
+    chat_completions_path = "/chat/completions"
+    responses_path = "/responses"
+    if chat_completions_path in base_url or responses_path in base_url:
+        hint["passthrough_full_url"] = True
+        hint["note"] = (
+            "base_url already includes a request path; NewAPI will treat this as a "
+            "full-URL passthrough channel (do not re-append /chat/completions). "
+            "This is the same shape as type=8 volcengine ark coding channels."
+        )
+    else:
+        hint["passthrough_full_url"] = False
+    if int(channel.get("type") or 0) == 1 and not hint["passthrough_full_url"]:
+        hint["adapter"] = "OpenAI-compatible (NewAPI appends /chat/completions or /responses)"
+    return hint
+
+
+def preview_channel_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    channel = dict(payload["channel"])
+    channel["key"] = redact_secret_field(channel.get("key"))
+    return {
+        "mode": payload["mode"],
+        "channel": channel,
+        "routing_hint": _routing_hint_for_create(channel),
+    }
+
+
+def redact_secret_field(value: Any) -> dict[str, Any]:
+    text = "" if value is None else str(value)
+    return {
+        "present": bool(text),
+        "sha256": secret_fingerprint(text),
+        "redacted": redact(text),
+    }
+
+
+def preview_text(value: Any, *, limit: int = 300) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def is_sensitive_field(name: Any) -> bool:
+    text = str(name).lower()
+    exact = {
+        "key",
+        "api_key",
+        "apikey",
+        "openai_api_key",
+        "token",
+        "api_token",
+        "access_token",
+        "refresh_token",
+        "admin_token",
+        "secret",
+        "password",
+        "authorization",
+        "credential",
+    }
+    if text in exact:
+        return True
+    return any(marker in text for marker in ["secret", "password", "authorization", "credential"])
+
+
+def redacted_tree(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if is_sensitive_field(key):
+                result[key] = redact_secret_field(item)
+            else:
+                result[key] = redacted_tree(item)
+        return result
+    if isinstance(value, list):
+        return [redacted_tree(item) for item in value]
+    return value
+
+
+def redacted_channel(channel: dict[str, Any]) -> dict[str, Any]:
+    item = dict(channel)
+    if "key" in item:
+        item["key"] = redact_secret_field(item.get("key"))
+    for field in ["header_override", "param_override", "setting", "settings", "other"]:
+        if field in item and isinstance(item[field], str):
+            item[field] = preview_text(item[field], limit=500)
+    return item
+
+
+def channel_summary(channel: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": channel.get("id"),
+        "name": channel.get("name"),
+        "type": channel.get("type"),
+        "base_url": channel.get("base_url"),
+        "models": channel.get("models"),
+        "group": channel.get("group"),
+        "status": channel.get("status"),
+        "priority": channel.get("priority"),
+        "weight": channel.get("weight"),
+        "tag": channel.get("tag"),
+        "response_time": channel.get("response_time"),
+        "test_time": channel.get("test_time"),
+    }
+
+
+def redacted_token(token: dict[str, Any]) -> dict[str, Any]:
+    item = dict(token)
+    if "key" in item:
+        item["key"] = redact_secret_field(item.get("key"))
+    return item
+
+
+def token_summary(token: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": token.get("id"),
+        "name": token.get("name"),
+        "status": token.get("status"),
+        "expired_time": token.get("expired_time"),
+        "remain_quota": token.get("remain_quota"),
+        "unlimited_quota": token.get("unlimited_quota"),
+        "model_limits_enabled": token.get("model_limits_enabled"),
+        "model_limits": token.get("model_limits"),
+        "allow_ips": token.get("allow_ips"),
+        "group": token.get("group"),
+        "cross_group_retry": token.get("cross_group_retry"),
+        "used_quota": token.get("used_quota"),
+        "accessed_time": token.get("accessed_time"),
+        "key": redact_secret_field(token.get("key")),
+    }
+
+
+def change_summary(before: dict[str, Any], after: dict[str, Any], fields: list[str]) -> list[dict[str, Any]]:
+    changes = []
+    for field in fields:
+        if before.get(field) == after.get(field):
+            continue
+        old = before.get(field)
+        new = after.get(field)
+        if is_sensitive_field(field):
+            old = redact_secret_field(old)
+            new = redact_secret_field(new)
+        changes.append({"field": field, "before": old, "after": new})
+    return changes
+
+
+def read_secret_arg(args: argparse.Namespace, *, optional: bool = False) -> str:
+    if getattr(args, "api_key_cred", ""):
+        return reveal_credential(args.api_key_cred).strip()
+    if getattr(args, "key_stdin", False):
+        secret = sys.stdin.read().strip()
+        if secret:
+            return secret
+    if optional:
+        return ""
+    raise CliError("provide --api-key-cred or --key-stdin")
+
+
+def fetch_existing_channels(args: argparse.Namespace) -> list[dict[str, Any]]:
+    first = api_request(args, "GET", "/api/channel/", params={"p": 1, "page_size": 100})
+    data = first.get("data", {}) if isinstance(first, dict) else {}
+    total = int(data.get("total") or 0)
+    items = list(data.get("items") or [])
+    page_size = 100
+    page = 2
+    while len(items) < total:
+        resp = api_request(args, "GET", "/api/channel/", params={"p": page, "page_size": page_size})
+        batch = resp.get("data", {}).get("items") or []
+        if not batch:
+            break
+        items.extend(batch)
+        page += 1
+    return items
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    status = requests.get(args.base_url.rstrip("/") + "/api/status", timeout=args.timeout).json()
+    channels = api_request(args, "GET", "/api/channel/", params={"p": 1, "page_size": 1})
+    payload = {
+        "ok": True,
+        "base_url": args.base_url,
+        "service_success": status.get("success"),
+        "version": status.get("data", {}).get("version"),
+        "setup": status.get("data", {}).get("setup"),
+        "admin_api": "raw Authorization access_token + New-Api-User",
+        "user_id": str(args.user_id),
+        "channels_total": channels.get("data", {}).get("total"),
+    }
+    emit(payload, args.json)
+    return 0
+
+
+def command_channels_list(args: argparse.Namespace) -> int:
+    data = api_request(
+        args,
+        "GET",
+        "/api/channel/",
+        params={
+            "p": args.page,
+            "page_size": args.page_size,
+            "status": args.status,
+            "type": args.type_filter,
+            "group": args.group_filter,
+            "id_sort": str(args.id_sort).lower(),
+        },
+    )
+    items = data.get("data", {}).get("items", [])
+    result = {
+        "total": data.get("data", {}).get("total"),
+        "items": [channel_summary(item) for item in items],
+    }
+    emit(result, args.json)
+    return 0
+
+
+def command_channels_get(args: argparse.Namespace) -> int:
+    data = api_request(args, "GET", f"/api/channel/{args.id}")
+    channel = data.get("data") or {}
+    emit(redacted_channel(channel), args.json)
+    return 0
+
+
+def command_channels_create(args: argparse.Namespace) -> int:
+    key = read_secret_arg(args)
+    payload = build_channel_create_payload(args, key)
+    result: dict[str, Any] = {
+        "dry_run": not effective_apply(args),
+        "channel": preview_channel_create_payload(payload),
+    }
+    if effective_apply(args):
+        result["api"] = redacted_tree(api_request(args, "POST", "/api/channel/", json_body=payload))
+    emit(result, args.json)
+    return 0
+
+
+def command_channels_update(args: argparse.Namespace) -> int:
+    data = api_request(args, "GET", f"/api/channel/{args.id}")
+    before = data.get("data") or {}
+    after = dict(before)
+    fields: list[str] = []
+    simple_updates = {
+        "name": args.name,
+        "models": args.models,
+        "group": args.group,
+        "tag": args.tag,
+        "priority": args.priority,
+        "weight": args.weight,
+        "status": args.status,
+        "test_model": args.test_model,
+        "model_mapping": args.model_mapping,
+        "status_code_mapping": args.status_code_mapping,
+        "remark": args.remark,
+        "auto_ban": args.auto_ban,
+        "other": args.other,
+    }
+    for field, value in simple_updates.items():
+        if value is None:
+            continue
+        after[field] = value
+        fields.append(field)
+    if args.type is not None:
+        after["type"] = coerce_channel_type(args.type)
+        fields.append("type")
+    if args.base_url_value is not None:
+        after["base_url"] = normalize_base_url(args.base_url_value, strip_v1=not args.keep_v1)
+        fields.append("base_url")
+    key = read_secret_arg(args, optional=True)
+    if key:
+        after["key"] = key
+        fields.append("key")
+    changes = change_summary(before, after, fields)
+    result: dict[str, Any] = {
+        "dry_run": not effective_apply(args),
+        "id": args.id,
+        "name": before.get("name"),
+        "changes": changes,
+    }
+    if effective_apply(args):
+        result["api"] = redacted_tree(api_request(args, "PUT", "/api/channel/", json_body=after))
+        result["after"] = redacted_channel(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
+    emit(result, args.json)
+    return 0
+
+
+def channel_test_via_newapi(args: argparse.Namespace, channel_id: int, model: str, *, stream: bool = False) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if model:
+        params["model"] = model
+    if stream:
+        params["stream"] = "true"
+    try:
+        data = api_request(args, "GET", f"/api/channel/test/{channel_id}", params=params or None)
+        return {
+            "via": "newapi",
+            "ok": bool(data.get("success")),
+            "message": data.get("message"),
+            "time": data.get("time"),
+            "stream": bool(stream),
+        }
+    except (CliError, requests.RequestException) as exc:
+        return {
+            "via": "newapi",
+            "ok": False,
+            "message": preview_text(str(exc), limit=240),
+            "stream": bool(stream),
+        }
+
+
+def _resolve_test_models(channel: dict[str, Any], requested: str) -> list[str]:
+    if requested == "*":
+        models = split_list(channel.get("models"))
+        return models or ([channel.get("test_model")] if channel.get("test_model") else [])
+    if requested:
+        return [requested]
+    if channel.get("test_model"):
+        return [str(channel.get("test_model"))]
+    models = split_list(channel.get("models"))
+    return [models[0]] if models else [""]
+
+
+def command_channels_test(args: argparse.Namespace) -> int:
+    channel_data = api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {}
+    models = _resolve_test_models(channel_data, args.model)
+    via = args.via
+
+    results: list[dict[str, Any]] = []
+    for m in models:
+        per_model: dict[str, Any] = {"model": m or None, "results": []}
+        if via in ("newapi", "both"):
+            per_model["results"].append(channel_test_via_newapi(args, args.id, m, stream=bool(args.stream)))
+        if via in ("relay", "both"):
+            if not m:
+                per_model["results"].append({
+                    "via": "relay",
+                    "ok": False,
+                    "error": "no model resolved; pass --model or set channel test_model",
+                })
+            else:
+                per_model["results"].append(sse_probe_via_relay(args, model=m))
+        per_model["ok"] = any(r.get("ok") for r in per_model["results"])
+        results.append(per_model)
+
+    overall_ok = all(r["ok"] for r in results) if results else False
+    emit(
+        {
+            "id": args.id,
+            "channel_name": channel_data.get("name"),
+            "via": via,
+            "ok": overall_ok,
+            "tested": results,
+        },
+        args.json,
+    )
+    return 0 if overall_ok else 1
+
+
+def dict_from_json_field(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        parsed = parse_json_maybe(value)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def channel_probe_model(channel: dict[str, Any]) -> str:
+    other_info = dict_from_json_field(channel.get("other_info"))
+    hold = dict_from_json_field(other_info.get("relay_gate_quota_hold"))
+    evidence = dict_from_json_field(hold.get("evidence"))
+    evidence_model = str(evidence.get("model") or "").strip()
+    if evidence_model:
+        return evidence_model
+
+    models = split_list(channel.get("models"))
+    test_model = str(channel.get("test_model") or "").strip()
+    if test_model and test_model not in AUTO_PROBE_MODELS:
+        return test_model
+    for model in models:
+        if model not in AUTO_PROBE_MODELS:
+            return model
+    if test_model:
+        return test_model
+    return models[0] if models else ""
+
+
+def stream_probe_channel(args: argparse.Namespace, channel: dict[str, Any], *, model: str = "") -> dict[str, Any]:
+    channel_id = int(channel.get("id") or 0)
+    probe_model = model.strip() if model else channel_probe_model(channel)
+    if not channel_id or not probe_model:
+        return {"ok": False, "message": "no channel id or probe model", "model": probe_model or None, "stream": True}
+    return channel_test_via_newapi(args, channel_id, probe_model, stream=True)
+
+
+def is_quota_exhausted_message(message: str) -> bool:
+    text = str(message or "")
+    if "\\u" in text or "\\x" in text:
+        try:
+            text = bytes(text, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            pass
+    lower = text.lower()
+    return (
+        "额度已用尽" in text
+        or "余额不足" in text
+        or "quota exceeded" in lower
+        or "insufficient quota" in lower
+        or "insufficient balance" in lower
+    )
+
+
+def build_quota_hold_evidence(source: str, *, message: str, model: str | None = None, log_id: Any = None) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "source": source,
+        "message": preview_text(message, limit=240),
+    }
+    if model:
+        evidence["model"] = model
+    if log_id is not None:
+        evidence["log_id"] = log_id
+    return evidence
+
+
+def set_channel_quota_hold(
+    args: argparse.Namespace,
+    channel: dict[str, Any],
+    *,
+    evidence: dict[str, Any],
+    apply: bool,
+) -> dict[str, Any]:
+    before = dict(channel)
+    after = dict(channel)
+    other_info = dict_from_json_field(after.get("other_info"))
+    hold = dict_from_json_field(other_info.get("relay_gate_quota_hold"))
+    already_held = int(after.get("status") or 0) == CHANNEL_STATUS_MANUAL_DISABLED and hold.get("reason") == QUOTA_HOLD_REASON
+    other_info["relay_gate_quota_hold"] = {
+        "reason": QUOTA_HOLD_REASON,
+        "held_at": int(time.time()),
+        "evidence": evidence,
+    }
+    other_info["status_reason"] = "quota exhausted; held by relay-gate until stream channel-test succeeds"
+    other_info["status_time"] = int(time.time())
+    after["other_info"] = json.dumps(other_info, ensure_ascii=False, separators=(",", ":"))
+    after["status"] = CHANNEL_STATUS_MANUAL_DISABLED
+    changes = change_summary(before, after, ["status", "other_info"])
+    result = {
+        "id": channel.get("id"),
+        "name": channel.get("name"),
+        "already_held": already_held,
+        "evidence": evidence,
+        "changes": changes,
+        "applied": False,
+    }
+    if apply and (changes or not already_held):
+        response = api_request(args, "PUT", "/api/channel/", json_body=after)
+        result["applied"] = bool(response.get("success"))
+        result["message"] = response.get("message") or ""
+    return result
+
+
+def recent_quota_evidence_by_channel(args: argparse.Namespace) -> dict[int, dict[str, Any]]:
+    evidence: dict[int, dict[str, Any]] = {}
+    logs = fetch_log_items(args, page_size=int(getattr(args, "log_page_size", 100) or 100))
+    for item in logs:
+        channel_id = int(item.get("channel") or 0)
+        if not channel_id:
+            continue
+        channel_name = str(item.get("channel_name") or "")
+        model_name = str(item.get("model_name") or "")
+        if not channel_name.startswith("buddy-") and not model_name.startswith("buddy-"):
+            continue
+        content = str(item.get("content") or item.get("content_preview") or "")
+        if not is_quota_exhausted_message(content):
+            continue
+        evidence[channel_id] = build_quota_hold_evidence("recent_log", message=content, model=model_name or None, log_id=item.get("id"))
+    return evidence
+
+
+def _coerce_int_list(values: Any) -> list[int]:
+    items: list[int] = []
+    for value in values or []:
+        try:
+            items.append(int(str(value).strip()))
+        except (TypeError, ValueError):
+            continue
+    return items
+
+
+def _coerce_str_list(values: Any) -> list[str]:
+    items: list[str] = []
+    for value in values or []:
+        text = str(value).strip()
+        if text:
+            items.append(text)
+    return items
+
+
+def _append_unique(existing: list[Any], additions: list[Any]) -> tuple[list[Any], list[Any]]:
+    seen = set(existing)
+    merged = list(existing)
+    added: list[Any] = []
+    for item in additions:
+        if item in seen:
+            continue
+        seen.add(item)
+        merged.append(item)
+        added.append(item)
+    return merged, added
+
+
+def merge_responses_bridge_policy(
+    current: Any,
+    *,
+    channel_ids: list[int] | None = None,
+    model_patterns: list[str] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    policy = dict(current) if isinstance(current, dict) else {}
+    changes: list[dict[str, Any]] = []
+
+    if policy.get("enabled") is not True:
+        policy["enabled"] = True
+        changes.append({"field": "enabled", "after": True})
+    if "all_channels" not in policy:
+        policy["all_channels"] = False
+        changes.append({"field": "all_channels", "after": False})
+
+    existing_ids = _coerce_int_list(policy.get("channel_ids"))
+    merged_ids, added_ids = _append_unique(existing_ids, _coerce_int_list(channel_ids))
+    policy["channel_ids"] = merged_ids
+    if added_ids:
+        changes.append({"field": "channel_ids", "added": added_ids})
+
+    existing_patterns = _coerce_str_list(policy.get("model_patterns"))
+    merged_patterns, added_patterns = _append_unique(existing_patterns, _coerce_str_list(model_patterns))
+    policy["model_patterns"] = merged_patterns
+    if added_patterns:
+        changes.append({"field": "model_patterns", "added": added_patterns})
+
+    if "channel_types" in policy and policy["channel_types"] is not None:
+        policy["channel_types"] = _coerce_int_list(policy.get("channel_types"))
+
+    return policy, changes
+
+
+def _load_responses_bridge_policy(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+    data = api_request(args, "GET", "/api/option/")
+    for item in data.get("data") or []:
+        if item.get("key") != RESPONSES_BRIDGE_OPTION_KEY:
+            continue
+        raw = str(item.get("value") or "").strip()
+        parsed = parse_json_maybe(raw) if raw else {}
+        return parsed if isinstance(parsed, dict) else {}, raw
+    return {}, ""
+
+
+def command_responses_bridge_get(args: argparse.Namespace) -> int:
+    policy, raw = _load_responses_bridge_policy(args)
+    emit(
+        {
+            "key": RESPONSES_BRIDGE_OPTION_KEY,
+            "value": policy,
+            "raw": raw,
+        },
+        args.json,
+    )
+    return 0
+
+
+def command_responses_bridge_ensure(args: argparse.Namespace) -> int:
+    before, _ = _load_responses_bridge_policy(args)
+    after, changes = merge_responses_bridge_policy(
+        before,
+        channel_ids=args.channel_id,
+        model_patterns=args.model_pattern,
+    )
+    payload = {
+        "key": RESPONSES_BRIDGE_OPTION_KEY,
+        "value": json.dumps(after, ensure_ascii=False, separators=(",", ":")),
+    }
+    result: dict[str, Any] = {
+        "dry_run": not effective_apply(args),
+        "key": RESPONSES_BRIDGE_OPTION_KEY,
+        "changes": changes,
+        "before": before,
+        "after": after,
+    }
+    if effective_apply(args):
+        result["api"] = redacted_tree(api_request(args, "PUT", "/api/option/", json_body=payload))
+        result["stored"] = True
+    emit(result, args.json)
+    return 0
+
+
+def hold_quota_channels(args: argparse.Namespace) -> dict[str, Any]:
+    channels = fetch_existing_channels(args)
+    channel_by_id = {int(ch.get("id") or 0): ch for ch in channels}
+    target_ids = set(int(i) for i in getattr(args, "channel_id", []) or [])
+    log_evidence = recent_quota_evidence_by_channel(args) if getattr(args, "from_logs", False) else {}
+    if getattr(args, "from_logs", False):
+        target_ids.update(log_evidence.keys())
+    results: list[dict[str, Any]] = []
+    for channel_id in sorted(target_ids):
+        channel = channel_by_id.get(channel_id)
+        if not channel:
+            results.append({"id": channel_id, "ok": False, "reason": "channel_not_found", "applied": False})
+            continue
+        full = api_request(args, "GET", f"/api/channel/{channel_id}").get("data") or {}
+        evidence = log_evidence.get(channel_id)
+        probe = None
+        if evidence is None:
+            probe = stream_probe_channel(args, full, model=getattr(args, "model", "") or "")
+            message = str(probe.get("message") or probe.get("error") or "")
+            if is_quota_exhausted_message(message):
+                evidence = build_quota_hold_evidence("stream_probe", message=message, model=probe.get("model") or channel_probe_model(full))
+        if evidence is None:
+            results.append({
+                "id": channel_id,
+                "name": full.get("name"),
+                "ok": False,
+                "reason": "quota_not_confirmed",
+                "probe": probe,
+                "applied": False,
+            })
+            continue
+        item = set_channel_quota_hold(args, full, evidence=evidence, apply=effective_apply(args))
+        item["ok"] = True
+        if probe is not None:
+            item["probe"] = probe
+        results.append(item)
+    return {"dry_run": not effective_apply(args), "results": results}
+
+
+def recover_channels(args: argparse.Namespace) -> dict[str, Any]:
+    channels = fetch_existing_channels(args)
+    target_ids = set(int(i) for i in getattr(args, "channel_id", []) or [])
+    if not target_ids:
+        for channel in channels:
+            status = int(channel.get("status") or 0)
+            if status in {CHANNEL_STATUS_AUTO_DISABLED, CHANNEL_STATUS_MANUAL_DISABLED}:
+                target_ids.add(int(channel.get("id") or 0))
+    channel_by_id = {int(ch.get("id") or 0): ch for ch in channels}
+    results: list[dict[str, Any]] = []
+    for channel_id in sorted(i for i in target_ids if i):
+        channel = channel_by_id.get(channel_id)
+        if not channel:
+            results.append({"id": channel_id, "ok": False, "reason": "channel_not_found", "applied": False})
+            continue
+        full = api_request(args, "GET", f"/api/channel/{channel_id}").get("data") or {}
+        status = int(full.get("status") or 0)
+        other_info = dict_from_json_field(full.get("other_info"))
+        hold = dict_from_json_field(other_info.get("relay_gate_quota_hold"))
+        is_quota_hold = status == CHANNEL_STATUS_MANUAL_DISABLED and hold.get("reason") == QUOTA_HOLD_REASON
+        if status == CHANNEL_STATUS_ENABLED:
+            results.append({"id": channel_id, "name": full.get("name"), "ok": True, "reason": "already_enabled", "applied": False})
+            continue
+        if status == CHANNEL_STATUS_MANUAL_DISABLED and not is_quota_hold:
+            results.append({"id": channel_id, "name": full.get("name"), "ok": False, "reason": "manual_disabled_not_quota_hold", "applied": False})
+            continue
+        probe = stream_probe_channel(args, full, model=getattr(args, "model", "") or "")
+        if not probe.get("ok"):
+            results.append({
+                "id": channel_id,
+                "name": full.get("name"),
+                "ok": False,
+                "reason": "probe_failed",
+                "probe": probe,
+                "applied": False,
+            })
+            continue
+        before = dict(full)
+        other_info.pop("relay_gate_quota_hold", None)
+        other_info["status_reason"] = "recovered by relay-gate stream channel-test"
+        other_info["status_time"] = int(time.time())
+        full["other_info"] = json.dumps(other_info, ensure_ascii=False, separators=(",", ":"))
+        full["status"] = CHANNEL_STATUS_ENABLED
+        changes = change_summary(before, full, ["status", "other_info"])
+        item = {
+            "id": channel_id,
+            "name": full.get("name"),
+            "ok": True,
+            "reason": "probe_passed_recovered",
+            "probe": probe,
+            "changes": changes,
+            "applied": False,
+        }
+        if effective_apply(args):
+            response = api_request(args, "PUT", "/api/channel/", json_body=full)
+            item["applied"] = bool(response.get("success"))
+            item["message"] = response.get("message") or ""
+        results.append(item)
+    return {"dry_run": not effective_apply(args), "results": results}
+
+
+def command_channels_hold_quota(args: argparse.Namespace) -> int:
+    result = hold_quota_channels(args)
+    emit(result, args.json)
+    return 0 if all(item.get("ok") for item in result["results"]) else 1
+
+
+def command_channels_recover(args: argparse.Namespace) -> int:
+    result = recover_channels(args)
+    emit(result, args.json)
+    return 0 if all(item.get("ok") for item in result["results"]) else 1
+
+
+def parse_model_mapping_value(value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    text = str(value).strip()
+    if text.lower() == "null":
+        return None
+    if text.startswith("{") or text.startswith("["):
+        return json.loads(text)
+    mapping: dict[str, str] = {}
+    for item in split_list(text):
+        if "=" not in item:
+            raise CliError(f"model mapping item must be alias=actual: {item}")
+        alias, actual = item.split("=", 1)
+        alias = alias.strip()
+        actual = actual.strip()
+        if not alias or not actual:
+            raise CliError(f"model mapping item must be alias=actual: {item}")
+        mapping[alias] = actual
+    return mapping
+
+
+def channel_model_summary(channel: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": channel.get("id"),
+        "name": channel.get("name"),
+        "status": channel.get("status"),
+        "tag": channel.get("tag"),
+        "models": split_list(channel.get("models")),
+        "test_model": channel.get("test_model"),
+        "model_mapping": parse_json_maybe(str(channel.get("model_mapping") or "")) if channel.get("model_mapping") else None,
+    }
+
+
+def command_channel_models_list(args: argparse.Namespace) -> int:
+    channels = fetch_existing_channels(args)
+    items = []
+    for channel in channels:
+        if args.channel_id and int(channel.get("id") or 0) not in set(args.channel_id):
+            continue
+        if args.tag and str(channel.get("tag") or "") not in set(args.tag):
+            continue
+        if not args.include_disabled and int(channel.get("status") or 0) != 1:
+            continue
+        items.append(channel_model_summary(channel))
+    emit({"total": len(items), "items": items}, args.json)
+    return 0
+
+
+def command_channel_models_set(args: argparse.Namespace) -> int:
+    data = api_request(args, "GET", f"/api/channel/{args.id}")
+    before = data.get("data") or {}
+    after = dict(before)
+    fields: list[str] = []
+    if args.models is not None:
+        models = ",".join(split_list(args.models))
+        if not models:
+            raise CliError("provide at least one model")
+        after["models"] = models
+        fields.append("models")
+        if args.test_model is None and not after.get("test_model"):
+            after["test_model"] = split_list(models)[0]
+            fields.append("test_model")
+    if args.test_model is not None:
+        after["test_model"] = args.test_model
+        fields.append("test_model")
+    if args.model_mapping is not None:
+        mapping = parse_model_mapping_value(args.model_mapping)
+        after["model_mapping"] = json.dumps(mapping, ensure_ascii=False, separators=(",", ":")) if mapping else ""
+        fields.append("model_mapping")
+    changes = change_summary(before, after, fields)
+    result: dict[str, Any] = {
+        "dry_run": not effective_apply(args),
+        "id": args.id,
+        "name": before.get("name"),
+        "changes": changes,
+    }
+    if effective_apply(args):
+        result["api"] = redacted_tree(api_request(args, "PUT", "/api/channel/", json_body=after))
+        result["after"] = channel_model_summary(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
+    emit(result, args.json)
+    return 0
+
+
+def find_token_by_name(args: argparse.Namespace, name: str) -> dict[str, Any] | None:
+    data = api_request(args, "GET", "/api/token/search", params={"keyword": name, "p": 1, "size": 100})
+    for item in data.get("data", {}).get("items", []):
+        if item.get("name") == name:
+            return item
+    return None
+
+
+def build_token_payload(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "name": args.name,
+        "expired_time": int(args.expired_time),
+        "remain_quota": int(args.remain_quota),
+        "unlimited_quota": bool(args.unlimited),
+        "model_limits_enabled": bool(args.model_limits_enabled),
+        "model_limits": args.model_limits or "",
+        "allow_ips": args.allow_ips or "",
+        "group": args.group,
+        "cross_group_retry": bool(args.cross_group_retry),
+    }
+
+
+def command_tokens_list(args: argparse.Namespace) -> int:
+    data = api_request(
+        args,
+        "GET",
+        "/api/token/search",
+        params={"keyword": args.keyword, "p": args.page, "size": args.page_size},
+    )
+    payload = data.get("data", {}) if isinstance(data, dict) else {}
+    items = payload.get("items") or []
+    emit(
+        {
+            "total": payload.get("total"),
+            "page": payload.get("page"),
+            "page_size": payload.get("page_size"),
+            "items": [token_summary(item) for item in items],
+        },
+        args.json,
+    )
+    return 0
+
+
+def command_tokens_get(args: argparse.Namespace) -> int:
+    data = api_request(args, "GET", f"/api/token/{args.id}")
+    emit(redacted_token(data.get("data") or {}), args.json)
+    return 0
+
+
+def command_tokens_create(args: argparse.Namespace) -> int:
+    payload = build_token_payload(args)
+    result: dict[str, Any] = {
+        "dry_run": not effective_apply(args),
+        "token": token_summary(payload),
+        "store_cred": args.store_cred or None,
+    }
+    if effective_apply(args):
+        result["api"] = redacted_tree(api_request(args, "POST", "/api/token/", json_body=payload))
+        token = find_token_by_name(args, args.name)
+        if token:
+            result["token"] = token_summary(token)
+            if args.store_cred:
+                key_resp = api_request(args, "POST", f"/api/token/{token['id']}/key")
+                key = key_resp.get("data", {}).get("key")
+                if not key:
+                    raise CliError("NewAPI did not return token key")
+                store_credential(
+                    args.store_cred,
+                    key,
+                    kind="token",
+                    note=(
+                        f"NewAPI API key for {args.base_url}/v1; token name {args.name}; "
+                        "generated/stored by relay-gate; do not reveal/log."
+                    ),
+                )
+                result["stored"] = args.store_cred
+                result["key"] = redact_secret_field(key)
+    emit(result, args.json)
+    return 0
+
+
+def command_tokens_update(args: argparse.Namespace) -> int:
+    data = api_request(args, "GET", f"/api/token/{args.id}")
+    before = data.get("data") or {}
+    after = dict(before)
+    fields: list[str] = []
+    updates = {
+        "name": args.name,
+        "status": args.status,
+        "expired_time": args.expired_time,
+        "remain_quota": args.remain_quota,
+        "unlimited_quota": args.unlimited,
+        "model_limits_enabled": args.model_limits_enabled,
+        "model_limits": args.model_limits,
+        "allow_ips": args.allow_ips,
+        "group": args.group,
+        "cross_group_retry": args.cross_group_retry,
+    }
+    for field, value in updates.items():
+        if value is None:
+            continue
+        after[field] = value
+        fields.append(field)
+    changes = change_summary(before, after, fields)
+    result: dict[str, Any] = {
+        "dry_run": not effective_apply(args),
+        "id": args.id,
+        "name": before.get("name"),
+        "changes": changes,
+    }
+    if effective_apply(args):
+        result["api"] = redacted_tree(api_request(args, "PUT", "/api/token/", json_body=after))
+        result["after"] = redacted_token(api_request(args, "GET", f"/api/token/{args.id}").get("data") or {})
+    emit(result, args.json)
+    return 0
+
+
+def command_tokens_key(args: argparse.Namespace) -> int:
+    key_resp = api_request(args, "POST", f"/api/token/{args.id}/key")
+    key = key_resp.get("data", {}).get("key")
+    if not key:
+        raise CliError("NewAPI did not return token key")
+    result: dict[str, Any] = {
+        "id": args.id,
+        "key": redact_secret_field(key),
+        "stored": None,
+    }
+    if args.store_cred:
+        store_credential(
+            args.store_cred,
+            key,
+            kind="token",
+            note=(
+                f"NewAPI API key for {args.base_url}/v1; token id {args.id}; "
+                "stored by relay-gate; do not reveal/log."
+            ),
+        )
+        result["stored"] = args.store_cred
+    emit(result, args.json)
+    return 0
+
+
+def command_tokens_ensure_self(args: argparse.Namespace) -> int:
+    token = find_token_by_name(args, args.name)
+    created = False
+    if token is None:
+        payload = {
+            "name": args.name,
+            "expired_time": -1,
+            "remain_quota": int(args.remain_quota),
+            "unlimited_quota": args.unlimited,
+            "model_limits_enabled": False,
+            "model_limits": "",
+            "allow_ips": args.allow_ips or "",
+            "group": args.group,
+            "cross_group_retry": args.cross_group_retry,
+        }
+        api_request(args, "POST", "/api/token/", json_body=payload)
+        token = find_token_by_name(args, args.name)
+        created = True
+    if token is None:
+        raise CliError("token was created but could not be found")
+    key_resp = api_request(args, "POST", f"/api/token/{token['id']}/key")
+    key = key_resp.get("data", {}).get("key")
+    if not key:
+        raise CliError("NewAPI did not return token key")
+    if args.store:
+        store_credential(
+            args.cred_name,
+            key,
+            kind="token",
+            note=(
+                f"NewAPI self-use API key for {args.base_url}/v1; token name {args.name}; "
+                "generated/stored by relay-gate; do not reveal/log."
+            ),
+        )
+    emit(
+        {
+            "ok": True,
+            "created": created,
+            "token_id": token.get("id"),
+            "name": args.name,
+            "base_url": args.base_url.rstrip("/") + "/v1",
+            "key": redact(key),
+            "stored": args.cred_name if args.store else None,
+        },
+        args.json,
+    )
+    return 0
+
+
+def parse_json_maybe(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def summarize_log_item(item: dict[str, Any], *, include_other: bool = False) -> dict[str, Any]:
+    result = {
+        "id": item.get("id"),
+        "created_at": item.get("created_at"),
+        "type": item.get("type"),
+        "username": item.get("username"),
+        "token_name": item.get("token_name"),
+        "model_name": item.get("model_name"),
+        "quota": item.get("quota"),
+        "prompt_tokens": item.get("prompt_tokens"),
+        "completion_tokens": item.get("completion_tokens"),
+        "use_time": item.get("use_time"),
+        "is_stream": item.get("is_stream"),
+        "channel": item.get("channel"),
+        "channel_name": item.get("channel_name"),
+        "token_id": item.get("token_id"),
+        "group": item.get("group"),
+        "ip": item.get("ip"),
+        "content_preview": preview_text(item.get("content"), limit=300),
+    }
+    other = str(item.get("other") or "")
+    if include_other:
+        result["other"] = parse_json_maybe(other) if other else None
+    else:
+        result["other_preview"] = preview_text(other, limit=300)
+    return result
+
+
+def command_logs_recent(args: argparse.Namespace) -> int:
+    path = "/api/log/self" if args.self else "/api/log/"
+    data = api_request(args, "GET", path, params={"p": args.page, "page_size": args.page_size})
+    payload = data.get("data", {}) if isinstance(data, dict) else {}
+    items = payload.get("items") or []
+    emit(
+        {
+            "total": payload.get("total"),
+            "page": payload.get("page"),
+            "page_size": payload.get("page_size"),
+            "items": [summarize_log_item(item, include_other=args.include_other) for item in items],
+        },
+        args.json,
+    )
+    return 0
+
+
+def command_logs_stats(args: argparse.Namespace) -> int:
+    data = api_request(args, "GET", "/api/log/stat")
+    emit(data.get("data") if isinstance(data, dict) else data, args.json)
+    return 0
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def model_set(value: Any) -> set[str]:
+    return set(split_list(value))
+
+
+def channel_matches_optimize_scope(channel: dict[str, Any], args: argparse.Namespace) -> tuple[bool, str]:
+    if args.channel_id and int(channel.get("id") or 0) not in set(args.channel_id):
+        return False, "channel_id"
+    if not args.include_disabled and int(channel.get("status") or 0) != 1:
+        return False, "disabled"
+    if not args.all_tags and args.tag:
+        tags = set(args.tag)
+        if str(channel.get("tag") or "") not in tags:
+            return False, "tag"
+    requested_models = set(args.model)
+    supported = model_set(channel.get("models"))
+    if requested_models and supported and requested_models.isdisjoint(supported):
+        return False, "model"
+    return True, "ok"
+
+
+def probe_model_for_channel(channel: dict[str, Any], models: list[str]) -> str:
+    if models:
+        return models[0]
+    supported = split_list(channel.get("models"))
+    return supported[0] if supported else DEFAULT_MODELS
+
+
+def optimize_models_for_channels(channels: list[dict[str, Any]], requested_models: list[str]) -> list[str]:
+    if requested_models:
+        return list(dict.fromkeys(requested_models))
+    models: list[str] = []
+    seen: set[str] = set()
+    for channel in channels:
+        for model in split_list(channel.get("models")):
+            if model and model not in seen:
+                seen.add(model)
+                models.append(model)
+    return models
+
+
+def channel_supports_model(channel: dict[str, Any], model: str) -> bool:
+    supported = model_set(channel.get("models"))
+    return not supported or model in supported
+
+
+def fetch_log_items(args: argparse.Namespace, *, page_size: int) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    pages = int(getattr(args, "log_pages", 1) or 1)
+    for page in range(1, max(1, pages) + 1):
+        data = api_request(args, "GET", "/api/log/", params={"p": page, "page_size": page_size})
+        payload = data.get("data", {}) if isinstance(data, dict) else {}
+        page_items = list(payload.get("items") or [])
+        if not page_items:
+            break
+        items.extend(page_items)
+    return items
+
+
+def log_other(item: dict[str, Any]) -> dict[str, Any]:
+    other = item.get("other")
+    if isinstance(other, dict):
+        return other
+    if isinstance(other, str) and other.strip():
+        parsed = parse_json_maybe(other)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def build_channel_log_stats(
+    logs: list[dict[str, Any]],
+    models: list[str],
+    *,
+    include_admin_tests: bool = False,
+) -> dict[int, dict[str, Any]]:
+    wanted = set(models)
+    stats: dict[int, dict[str, Any]] = {}
+    latest_seen = 0
+    for item in logs:
+        if not include_admin_tests and int(item.get("token_id") or 0) == 0:
+            continue
+        created_at = int(item.get("created_at") or 0)
+        latest_seen = max(latest_seen, created_at)
+        channel_id = int(item.get("channel") or 0)
+        if not channel_id:
+            channel_id = int(log_other(item).get("channel_id") or 0)
+        if not channel_id:
+            continue
+        model = str(item.get("model_name") or "")
+        if wanted and model and model not in wanted:
+            continue
+        bucket = stats.setdefault(
+            channel_id,
+            {
+                "success": 0,
+                "failure": 0,
+                "use_times": [],
+                "quota": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "status_codes": {},
+                "budget_errors": 0,
+                "responses_success": 0,
+                "responses_conversion_failures": 0,
+                "last_error": "",
+                "last_outcome": "",
+                "last_created_at": 0,
+            },
+        )
+        if not bucket["last_created_at"]:
+            bucket["last_created_at"] = created_at
+        log_type = int(item.get("type") or 0)
+        if log_type == 2:
+            if not bucket["last_outcome"]:
+                bucket["last_outcome"] = "success"
+            bucket["success"] += 1
+            other = log_other(item)
+            if other.get("request_path") == "/v1/responses":
+                bucket["responses_success"] += 1
+            use_time = item.get("use_time")
+            if isinstance(use_time, (int, float)) and use_time > 0:
+                bucket["use_times"].append(float(use_time))
+            bucket["quota"] += int(item.get("quota") or 0)
+            bucket["prompt_tokens"] += int(item.get("prompt_tokens") or 0)
+            bucket["completion_tokens"] += int(item.get("completion_tokens") or 0)
+        elif log_type == 5:
+            if not bucket["last_outcome"]:
+                bucket["last_outcome"] = "failure"
+            bucket["failure"] += 1
+            content = str(item.get("content") or "")
+            bucket["last_error"] = content[:180]
+            other = log_other(item)
+            if other.get("request_path") == "/v1/responses" and other.get("error_code") == "convert_request_failed":
+                bucket["responses_conversion_failures"] += 1
+                bucket["last_outcome"] = "responses_protocol_error"
+            status_code = other.get("status_code")
+            if status_code is not None:
+                key = str(status_code)
+                bucket["status_codes"][key] = int(bucket["status_codes"].get(key, 0)) + 1
+                if key in {"402", "403"}:
+                    bucket["budget_errors"] += 1
+                    if bucket["last_outcome"] == "failure":
+                        bucket["last_outcome"] = "budget_error"
+            if re.search(r"(?i)(insufficient|balance|quota|billing|余额|额度)", content):
+                bucket["budget_errors"] += 1
+                if bucket["last_outcome"] == "failure":
+                    bucket["last_outcome"] = "budget_error"
+    for bucket in stats.values():
+        total = int(bucket["success"]) + int(bucket["failure"])
+        bucket["total"] = total
+        bucket["success_rate"] = (float(bucket["success"]) / total) if total else None
+        times = bucket["use_times"]
+        bucket["avg_use_time"] = (sum(times) / len(times)) if times else None
+        bucket["age_seconds"] = max(0, latest_seen - int(bucket.get("last_created_at") or 0)) if latest_seen else None
+    return stats
+
+
+def _channel_protocol_hint(channel: dict[str, Any]) -> str:
+    other = parse_json_maybe(str(channel.get("other_info") or ""))
+    if isinstance(other, dict):
+        relay_gate = other.get("relay_gate")
+        if isinstance(relay_gate, dict):
+            hint = relay_gate.get("protocol_hint")
+            if isinstance(hint, str) and hint:
+                return hint.strip().lower()
+    return ""
+
+
+def probe_channel(args: argparse.Namespace, channel: dict[str, Any], model: str) -> dict[str, Any] | None:
+    if not args.probe:
+        return None
+    channel_id = int(channel.get("id") or 0)
+    hint = _channel_protocol_hint(channel)
+    # SSE-only upstreams (e.g. type=8 passthrough channels like buddy-chicross)
+    # always fail NewAPI's internal /api/channel/test because it expects a JSON
+    # body. Skip the probe instead of penalizing them. Logs-based scoring still
+    # reflects real success/failure.
+    if hint == "sse-only":
+        return {
+            "success": None,
+            "time": None,
+            "message": "skipped: protocol_hint=sse-only",
+            "skipped": True,
+        }
+    try:
+        data = api_request(args, "GET", f"/api/channel/test/{channel_id}", params={"model": model})
+        return {"success": bool(data.get("success")), "time": data.get("time"), "message": data.get("message") or ""}
+    except (CliError, requests.RequestException) as exc:
+        return {"success": False, "time": None, "message": preview_text(str(exc), limit=240)}
+
+
+def score_channel(
+    channel: dict[str, Any],
+    stats: dict[str, Any],
+    probe: dict[str, Any] | None,
+    *,
+    recent_window_seconds: int,
+) -> dict[str, Any]:
+    success = int(stats.get("success") or 0)
+    failure = int(stats.get("failure") or 0)
+    total = success + failure
+    success_rate = stats.get("success_rate")
+    if success_rate is None:
+        success_rate = 0.55 if int(channel.get("test_time") or 0) else 0.35
+    response_ms = float(channel.get("response_time") or 0)
+    if stats.get("avg_use_time"):
+        response_ms = float(stats["avg_use_time"]) * 1000
+    if probe:
+        if probe.get("success") and isinstance(probe.get("time"), (int, float)):
+            response_ms = float(probe["time"]) * 1000
+            success_rate = max(float(success_rate), 0.92)
+        elif probe.get("success") is False:
+            failure += 1
+            total += 1
+            success_rate = success / total if total else 0
+    test_time = int(channel.get("test_time") or 0)
+    test_age_seconds = max(0, int(time.time()) - test_time) if test_time else None
+    probe_skipped = bool(probe and probe.get("skipped"))
+    test_success = bool(
+        (not probe or probe_skipped)
+        and test_time
+        and (recent_window_seconds <= 0 or test_age_seconds is not None and test_age_seconds <= recent_window_seconds)
+        and response_ms > 0
+    )
+    if test_success:
+        success_rate = max(float(success_rate), 0.88)
+    latency_score = 0.45 if response_ms <= 0 else clamp(1.0 - (response_ms / 120000.0), 0.0, 1.0)
+    budget_errors = int(stats.get("budget_errors") or 0)
+    budget_blocked = budget_errors > 0 and (
+        success == 0 or budget_errors >= max(success, 1) or stats.get("last_outcome") == "budget_error"
+    )
+    responses_conversion_failures = int(stats.get("responses_conversion_failures") or 0)
+    responses_success = int(stats.get("responses_success") or 0)
+    responses_protocol_blocked = responses_conversion_failures > 0 and responses_success == 0
+    score = (float(success_rate) * 0.72) + (latency_score * 0.28)
+    age_seconds = stats.get("age_seconds")
+    freshness = None
+    if isinstance(age_seconds, int) and recent_window_seconds > 0:
+        freshness = clamp(1.0 - (age_seconds / float(recent_window_seconds)), 0.0, 1.0)
+        if test_success or (probe and probe.get("success")):
+            freshness = max(freshness, 1.0)
+        score *= 0.55 + (0.45 * freshness)
+    if total == 0:
+        score -= 0.12
+    if failure:
+        failure_rate = failure / max(total, 1)
+        score -= min(0.12 if test_success or (probe and probe.get("success")) else 0.25, failure_rate * 0.35)
+    if budget_blocked:
+        score -= 0.45
+    if responses_protocol_blocked:
+        score -= 0.55
+    if int(channel.get("status") or 0) != 1:
+        score -= 0.4
+    return {
+        "score": round(clamp(score, 0.0, 1.0), 3),
+        "success": success,
+        "failure": failure,
+        "total": total,
+        "success_rate": round(float(success_rate), 3) if success_rate is not None else None,
+        "response_ms": int(response_ms) if response_ms else None,
+        "budget_blocked": budget_blocked,
+        "budget_errors": budget_errors,
+        "responses_protocol_blocked": responses_protocol_blocked,
+        "responses_conversion_failures": responses_conversion_failures,
+        "responses_success": responses_success,
+        "last_outcome": stats.get("last_outcome") or "",
+        "age_seconds": age_seconds,
+        "freshness": round(float(freshness), 3) if freshness is not None else None,
+        "test_success": test_success or bool(probe and probe.get("success")),
+        "test_age_seconds": test_age_seconds,
+        "status_codes": stats.get("status_codes") or {},
+        "last_error": stats.get("last_error") or "",
+    }
+
+
+def history_weight_from_score(score_data: dict[str, Any], args: argparse.Namespace) -> int:
+    success_key = "responses_success" if args.require_responses_success else "success"
+    successes = int(score_data.get(success_key) or 0)
+    failures = int(score_data.get("failure") or 0)
+    if successes <= 0:
+        return int(args.explore_weight)
+
+    total = successes + failures
+    success_rate = (successes / total) if total else 1.0
+    if success_rate < 0.8:
+        return int(args.explore_weight)
+
+    # NewAPI uses weight only inside the chosen priority layer. Keep this a
+    # history-volume signal: a channel that has carried many successful calls
+    # gets proportionally more traffic, capped by the configured primary weight.
+    weight = int(args.explore_weight) + successes
+    if success_rate >= 0.98 and successes >= 20:
+        weight += min(successes // 2, 25)
+    return max(int(args.explore_weight), min(int(args.primary_weight), weight))
+
+
+def channel_proposal_for_channel(
+    channel: dict[str, Any],
+    score_data: dict[str, Any],
+    *,
+    rank: int,
+    probe: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], str]:
+    budget_blocked = bool(score_data.get("budget_blocked"))
+    responses_protocol_blocked = bool(score_data.get("responses_protocol_blocked"))
+    responses_unverified = bool(args.require_responses_success) and int(score_data.get("responses_success") or 0) == 0
+    freshness = score_data.get("freshness")
+    test_passed = bool(probe and probe.get("success")) or bool(score_data.get("test_success"))
+    responses_passed = int(score_data.get("responses_success") or 0) > 0
+    has_current_evidence = freshness is None or float(freshness) > 0 or test_passed
+    latest_failure = score_data.get("last_outcome") in {"failure", "budget_error"}
+    preserve_current_primary = bool(score_data.get("preserve_current_primary"))
+    channel_enabled = int(channel.get("status") or 0) == 1
+    proven_for_primary = channel_enabled and (responses_passed if args.require_responses_success else test_passed)
+    if preserve_current_primary and not responses_protocol_blocked and not budget_blocked:
+        proven_for_primary = True
+    if responses_protocol_blocked:
+        priority = args.poor_priority
+        weight = args.poor_weight
+        reason = "responses_protocol_incompatible"
+    elif budget_blocked:
+        priority = args.poor_priority
+        weight = args.poor_weight
+        reason = "budget_or_quota_error"
+    elif proven_for_primary:
+        priority = args.primary_priority
+        weight = history_weight_from_score(score_data, args)
+        if weight >= args.primary_weight:
+            reason = "tested_and_history_heavy"
+        elif int(score_data.get("responses_success") or 0) > 0:
+            reason = "tested_responses_success"
+        else:
+            reason = "tested_success"
+    elif responses_unverified and test_passed:
+        priority = args.fallback_priority
+        weight = args.explore_weight
+        reason = "test_passed_but_responses_unverified"
+    elif responses_unverified:
+        priority = args.poor_priority
+        weight = args.poor_weight
+        reason = "responses_unverified"
+    elif test_passed:
+        priority = args.fallback_priority
+        weight = args.explore_weight
+        reason = "test_passed_fallback"
+    elif bool(args.explore) and channel_enabled and not latest_failure and has_current_evidence:
+        priority = args.poor_priority
+        weight = args.poor_weight
+        reason = "unproven_exploration_seed"
+    else:
+        priority = args.poor_priority
+        weight = args.poor_weight
+        reason = "poor_or_unproven"
+    proposal: dict[str, Any] = {
+        "priority": int(priority),
+        "weight": int(weight),
+    }
+    if args.target_group:
+        proposal["group"] = args.target_group
+    return proposal, reason
+
+
+def has_model_group_signal(candidates: list[dict[str, Any]]) -> bool:
+    for item in candidates:
+        score = item.get("score") or {}
+        probe = item.get("probe")
+        if int(score.get("success") or 0) > 0 or int(score.get("failure") or 0) > 0:
+            return True
+        if int(score.get("responses_success") or 0) > 0 or int(score.get("responses_conversion_failures") or 0) > 0:
+            return True
+        if probe and probe.get("success") is not None:
+            return True
+    return False
+
+
+def exposed_model_count(channel_or_item: dict[str, Any]) -> int:
+    return len(split_list(channel_or_item.get("models")))
+
+
+
+def _promote_on_recovery(
+    args: argparse.Namespace,
+    channels: list[dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """Pre-ranking pass: for each model, find the healthy max priority among
+    status=1 channels exposing that model; for any status=1 channel below that
+    bar, run a real SSE probe; if it passes, propose lifting its priority to
+    the healthy max. Weight is left untouched.
+
+    Returns (proposals_by_channel_id, audit_records).
+    """
+    proposals: dict[int, dict[str, Any]] = {}
+    audits: list[dict[str, Any]] = []
+    if not getattr(args, "promote_on_recovery", False):
+        return proposals, audits
+
+    enabled = [c for c in channels if int(c.get("status") or 0) == 1]
+    # Build per-model healthy max priority across enabled channels.
+    model_max: dict[str, int] = {}
+    model_members: dict[str, list[dict[str, Any]]] = {}
+    for ch in enabled:
+        for m in split_list(ch.get("models")):
+            if not m:
+                continue
+            pri = int(ch.get("priority") or 0)
+            model_max[m] = max(model_max.get(m, pri), pri)
+            model_members.setdefault(m, []).append(ch)
+
+    # Find candidates: status=1, but priority is below the promotion target.
+    # The target is the max of (a) the same-model healthy max across enabled
+    # channels exposing each of this channel's models, and (b) the global
+    # primary_priority. Clause (b) ensures that channels exposing models with
+    # no same-model competition (e.g. hermes-imported singleton channels) are
+    # still lifted to the primary tier when they probe healthy, rather than
+    # being left at priority=0 indefinitely.
+    candidate_ids: dict[int, dict[str, Any]] = {}
+    candidate_target: dict[int, int] = {}
+    candidate_blocking_models: dict[int, list[str]] = {}
+    primary_pri = int(getattr(args, "primary_priority", 10) or 0)
+    for ch in enabled:
+        ch_pri = int(ch.get("priority") or 0)
+        ch_models = [m for m in split_list(ch.get("models")) if m]
+        if not ch_models:
+            continue
+        same_model_max = max((model_max.get(m, ch_pri) for m in ch_models), default=ch_pri)
+        target = max(same_model_max, primary_pri)
+        if target <= ch_pri:
+            continue
+        cid = int(ch.get("id") or 0)
+        candidate_ids[cid] = ch
+        candidate_target[cid] = target
+        candidate_blocking_models[cid] = [m for m in ch_models if model_max.get(m, ch_pri) > ch_pri or primary_pri > ch_pri]
+
+    if not candidate_ids:
+        return proposals, audits
+
+    for cid, ch in candidate_ids.items():
+        target = candidate_target[cid]
+        blocking = candidate_blocking_models[cid]
+        # Pick a probe model: prefer the channel test_model if it is one of the
+        # blocking models, otherwise the first blocking model.
+        test_model = (ch.get("test_model") or "").strip()
+        probe_model = test_model if test_model in blocking else (blocking[0] if blocking else "")
+        if not probe_model:
+            audits.append({
+                "id": cid,
+                "name": ch.get("name"),
+                "current_priority": int(ch.get("priority") or 0),
+                "target_priority": target,
+                "blocking_models": blocking,
+                "promoted": False,
+                "reason": "no_probe_model",
+            })
+            continue
+        try:
+            probe = sse_probe_via_relay(
+                args,
+                model=probe_model,
+                prompt=getattr(args, "promote_probe_prompt", "ping"),
+                max_tokens=int(getattr(args, "promote_probe_max_tokens", 8) or 8),
+            )
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            audits.append({
+                "id": cid,
+                "name": ch.get("name"),
+                "current_priority": int(ch.get("priority") or 0),
+                "target_priority": target,
+                "blocking_models": blocking,
+                "probe_model": probe_model,
+                "promoted": False,
+                "reason": "probe_exception",
+                "error": preview_text(str(exc), limit=200),
+            })
+            continue
+        passed = bool(probe.get("ok"))
+        channel_model_count = exposed_model_count(ch)
+        multi_model_skipped = passed and channel_model_count > 1 and not getattr(args, "apply_multi_model_channel", False)
+        record = {
+            "id": cid,
+            "name": ch.get("name"),
+            "current_priority": int(ch.get("priority") or 0),
+            "target_priority": target,
+            "blocking_models": blocking,
+            "probe_model": probe_model,
+            "probe": {
+                "ok": probe.get("ok"),
+                "http_status": probe.get("http_status"),
+                "latency_ms": probe.get("latency_ms"),
+                "first_token_ms": probe.get("first_token_ms"),
+                "finish_reason": probe.get("finish_reason"),
+                "error": probe.get("error"),
+            },
+            "promoted": passed and not multi_model_skipped,
+            "reason": "multi_model_channel_level_priority" if multi_model_skipped else ("probe_passed" if passed else "probe_failed"),
+        }
+        if multi_model_skipped:
+            record["models"] = split_list(ch.get("models"))
+        if passed and not multi_model_skipped:
+            proposals[cid] = {"priority": target}
+        audits.append(record)
+    return proposals, audits
+
+
+def run_channel_optimization(args: argparse.Namespace) -> dict[str, Any]:
+    channels = fetch_existing_channels(args)
+    logs = fetch_log_items(args, page_size=args.log_page_size)
+    models = args.model
+    skipped = []
+    scoped_channels = []
+    for channel in channels:
+        include, reason = channel_matches_optimize_scope(channel, args)
+        if not include:
+            skipped.append({"id": channel.get("id"), "name": channel.get("name"), "reason": reason})
+            continue
+        scoped_channels.append(channel)
+    optimize_models = optimize_models_for_channels(scoped_channels, models) if args.per_model else [""]
+    recommendations = []
+    for optimize_model in optimize_models:
+        model_scope = [channel for channel in scoped_channels if not optimize_model or channel_supports_model(channel, optimize_model)]
+        if not model_scope:
+            continue
+        if args.per_model and len(model_scope) < 2:
+            skipped.append(
+                {
+                    "model": optimize_model,
+                    "channel_id": model_scope[0].get("id"),
+                    "name": model_scope[0].get("name"),
+                    "reason": "singleton_model",
+                }
+            )
+            continue
+        stats_by_channel = build_channel_log_stats(
+            logs,
+            [optimize_model] if optimize_model else models,
+            include_admin_tests=args.include_admin_tests,
+        )
+        candidates = []
+        for channel in model_scope:
+            probe = probe_channel(args, channel, optimize_model or probe_model_for_channel(channel, models))
+            score_data = score_channel(
+                channel,
+                stats_by_channel.get(int(channel["id"]), {}),
+                probe,
+                recent_window_seconds=args.recent_window_seconds,
+            )
+            candidates.append({"channel": channel, "score": score_data, "probe": probe})
+        if args.per_model and not has_model_group_signal(candidates):
+            skipped.append(
+                {
+                    "model": optimize_model,
+                    "channel_ids": [int(item["channel"].get("id") or 0) for item in candidates],
+                    "reason": "no_model_signal",
+                }
+            )
+            continue
+        current_primary_present = any(
+            int(item["channel"].get("priority") or 0) == args.primary_priority
+            and int(item["channel"].get("weight") or 0) >= args.primary_weight
+            and item["score"]["score"] >= args.min_primary_score
+            and not item["score"].get("budget_blocked")
+            and not item["score"].get("responses_protocol_blocked")
+            and (not args.require_responses_success or int(item["score"].get("responses_success") or 0) > 0)
+            for item in candidates
+        )
+        if current_primary_present:
+            for item in candidates:
+                channel = item["channel"]
+                if int(channel.get("priority") or 0) == args.primary_priority and int(channel.get("weight") or 0) >= args.primary_weight:
+                    item["score"]["preserve_current_primary"] = True
+        ranked = sorted(candidates, key=lambda item: item["score"]["score"], reverse=True)
+        for rank, item in enumerate(ranked):
+            channel = item["channel"]
+            proposal, reason = channel_proposal_for_channel(
+                channel,
+                item["score"],
+                rank=rank,
+                probe=item["probe"],
+                args=args,
+            )
+            fields = list(proposal.keys())
+            after = {**channel, **proposal}
+            changes = change_summary(channel, after, fields)
+            recommendations.append(
+                {
+                    "model": optimize_model or None,
+                    "id": channel.get("id"),
+                    "name": channel.get("name"),
+                    "models": channel.get("models"),
+                    "tag": channel.get("tag"),
+                    "current": {
+                        "status": channel.get("status"),
+                        "group": channel.get("group"),
+                        "priority": channel.get("priority"),
+                        "weight": channel.get("weight"),
+                        "response_time": channel.get("response_time"),
+                        "test_time": channel.get("test_time"),
+                    },
+                    "score": item["score"],
+                    "probe": item["probe"],
+                    "proposal": proposal,
+                    "reason": reason,
+                    "changes": changes,
+                }
+            )
+    apply_proposals: dict[int, dict[str, Any]] = {}
+    apply_skipped: list[dict[str, Any]] = []
+    promote_proposals, promote_audits = _promote_on_recovery(args, channels)
+    for cid, prop in promote_proposals.items():
+        merged = apply_proposals.get(cid)
+        if merged is None:
+            apply_proposals[cid] = dict(prop)
+        else:
+            if int(prop.get('priority', 0)) > int(merged.get('priority', 0)):
+                merged['priority'] = prop['priority']
+    for item in recommendations:
+        if not item["changes"]:
+            continue
+        channel_id = int(item["id"])
+        proposal = item["proposal"]
+        if args.per_model and exposed_model_count(item) > 1 and not getattr(args, "apply_multi_model_channel", False):
+            apply_skipped.append(
+                {
+                    "model": item.get("model"),
+                    "id": channel_id,
+                    "name": item.get("name"),
+                    "reason": "multi_model_channel_level_weight",
+                    "models": split_list(item.get("models")),
+                    "proposal": proposal,
+                }
+            )
+            continue
+        current = apply_proposals.get(channel_id)
+        if current is None:
+            apply_proposals[channel_id] = dict(proposal)
+            continue
+        # NewAPI stores priority/weight on the channel, not per exposed model.
+        # Merge per-model advice conservatively so one poor model does not
+        # demote a channel that is still healthy for another shared model.
+        if int(proposal.get("priority", 0)) > int(current.get("priority", 0)):
+            current["priority"] = proposal["priority"]
+        if int(proposal.get("weight", 0)) > int(current.get("weight", 0)):
+            current["weight"] = proposal["weight"]
+        if "group" in proposal and proposal.get("group"):
+            current["group"] = proposal["group"]
+    apply_results = []
+    if effective_apply(args):
+        for channel_id, proposal in apply_proposals.items():
+            full = api_request(args, "GET", f"/api/channel/{channel_id}").get("data") or {}
+            full.update(proposal)
+            updated = api_request(args, "PUT", "/api/channel/", json_body=full)
+            apply_results.append(
+                {
+                    "id": channel_id,
+                    "name": full.get("name"),
+                    "success": updated.get("success"),
+                    "message": updated.get("message"),
+                }
+            )
+    return {
+        "dry_run": not effective_apply(args),
+        "scope": {
+            "tags": "all" if args.all_tags or not args.tag else args.tag,
+            "models": models or "all",
+            "include_disabled": args.include_disabled,
+            "target_group": args.target_group or None,
+            "probe": bool(args.probe),
+            "include_admin_tests": bool(args.include_admin_tests),
+            "log_page_size": args.log_page_size,
+            "recent_window_seconds": args.recent_window_seconds,
+            "channel_ids": args.channel_id or None,
+            "per_model": bool(args.per_model),
+            "explore": bool(args.explore),
+            "explore_weight": args.explore_weight,
+            "min_explore_score": args.min_explore_score,
+            "require_responses_success": bool(args.require_responses_success),
+        },
+        "candidates": len(recommendations),
+        "skipped": skipped,
+        "recommendations": recommendations,
+        "apply_proposals": apply_proposals,
+        "apply_skipped": apply_skipped,
+        "applied": apply_results,
+        "promote_audits": promote_audits,
+    }
+
+
+def command_channels_optimize(args: argparse.Namespace) -> int:
+    emit(run_channel_optimization(args), args.json)
+    return 0
+
+
+def summarize_channel_optimizer_result(result: dict[str, Any]) -> dict[str, Any]:
+    recommendations = result.get("recommendations") or []
+    changed = [item for item in recommendations if item.get("changes")]
+    return {
+        "ok": True,
+        "time": int(time.time()),
+        "dry_run": result.get("dry_run"),
+        "candidates": result.get("candidates"),
+        "changed_channels": len(changed),
+        "applied": result.get("applied") or [],
+        "apply_skipped": result.get("apply_skipped") or [],
+        "promote_audits": result.get("promote_audits") or [],
+        "top": [
+            {
+                "model": item.get("model"),
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "reason": item.get("reason"),
+                "score": item.get("score", {}).get("score"),
+                "proposal": item.get("proposal"),
+                "changes": item.get("changes"),
+            }
+            for item in recommendations[:5]
+        ],
+    }
+
+
+def set_soft_disable_profile(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Keep NewAPI from casually banning temporary quota/rate-limit channels."""
+    desired = {
+        "AutomaticDisableChannelEnabled": "false",
+        "AutomaticEnableChannelEnabled": "false",
+        "AutomaticDisableStatusCodes": "401",
+        "AutomaticDisableKeywords": SOFT_DISABLE_KEYWORDS,
+        "ChannelDisableThreshold": "600",
+    }
+    data = api_request(args, "GET", "/api/option/")
+    current = {item.get("key"): str(item.get("value", "")) for item in data.get("data") or []}
+    changes: list[dict[str, Any]] = []
+    for key, value in desired.items():
+        before = current.get(key, "")
+        if before == value:
+            continue
+        change = {"key": key, "before": before, "after": value, "applied": False}
+        if effective_apply(args):
+            response = api_request(args, "PUT", "/api/option/", json_body={"key": key, "value": value})
+            change["applied"] = bool(response.get("success"))
+            change["message"] = response.get("message") or ""
+        changes.append(change)
+    return changes
+
+
+def channel_log_stats(logs: list[dict[str, Any]], *, now: int, window_seconds: int) -> dict[int, dict[str, Any]]:
+    stats: dict[int, dict[str, Any]] = {}
+    cutoff = now - window_seconds
+    for item in logs:
+        created = int(item.get("created_at") or 0)
+        if created < cutoff:
+            continue
+        channel_id = int(item.get("channel") or 0)
+        channel_name = str(item.get("channel_name") or "")
+        model_name = str(item.get("model_name") or "")
+        if not channel_id:
+            continue
+        bucket = stats.setdefault(
+            channel_id,
+            {
+                "channel_name": channel_name,
+                "total": 0,
+                "ok": 0,
+                "scanner_error": 0,
+                "client_gone": 0,
+                "upstream_error": 0,
+                "quota_or_429": 0,
+                "long_ok": 0,
+                "examples": [],
+            },
+        )
+        bucket["total"] += 1
+        other = item.get("other") or {}
+        if isinstance(other, str):
+            parsed = parse_json_maybe(other) if other.strip() else {}
+            other = parsed if isinstance(parsed, dict) else {}
+        stream_status = other.get("stream_status") or {}
+        status = stream_status.get("status")
+        end_reason = stream_status.get("end_reason")
+        end_error = str(stream_status.get("end_error") or "")
+        content = str(item.get("content_preview") or item.get("content") or "")
+        use_time = float(item.get("use_time") or 0)
+        if status == "ok":
+            bucket["ok"] += 1
+            if use_time >= 45:
+                bucket["long_ok"] += 1
+        if end_reason == "scanner_error" or "INTERNAL_ERROR" in end_error:
+            bucket["scanner_error"] += 1
+        if end_reason == "client_gone":
+            bucket["client_gone"] += 1
+        if item.get("type") == 5 or "status_code=500" in content or "status_code=503" in content or "上游没有返回计费信息" in content:
+            bucket["upstream_error"] += 1
+        if "status_code=429" in content or "quota" in content.lower() or "TooManyRequests" in content:
+            bucket["quota_or_429"] += 1
+        if len(bucket["examples"]) < 3 and (end_reason or content):
+            bucket["examples"].append(
+                {
+                    "id": item.get("id"),
+                    "model": model_name,
+                    "use_time": item.get("use_time"),
+                    "end_reason": end_reason,
+                    "end_error": end_error[:160],
+                    "content": content[:160],
+                }
+            )
+    return stats
+
+
+def stabilize_channel_weights(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Adjust channel weight based on recent log success/error rates.
+
+    Only weight is adjusted; priority stays static.  Channels with recent
+    scanner_error or upstream errors get their weight capped; healthy channels
+    gradually restore.  This runs every light round (every 10 min) but only
+    writes when weight actually needs to change."""
+    channels = fetch_existing_channels(args)
+    logs = fetch_log_items(args, page_size=int(getattr(args, "log_page_size", 100) or 100))
+    stats = channel_log_stats(logs, now=int(time.time()), window_seconds=int(getattr(args, "buddy_window_seconds", 10800) or 10800))
+    audits: list[dict[str, Any]] = []
+    for channel in channels:
+        channel_id = int(channel.get("id") or 0)
+        if int(channel.get("status") or 0) != CHANNEL_STATUS_ENABLED:
+            continue
+        current_weight = int(channel.get("weight") or 0)
+        target_weight = current_weight
+        stat = stats.get(channel_id, {"total": 0, "ok": 0, "scanner_error": 0, "client_gone": 0, "upstream_error": 0, "quota_or_429": 0, "long_ok": 0, "examples": []})
+        reason = "unchanged"
+        if int(stat.get("scanner_error") or 0) > 0:
+            target_weight = min(current_weight, int(getattr(args, "buddy_scanner_cap", 8) or 8))
+            reason = "scanner_error_cap"
+        elif int(stat.get("upstream_error") or 0) >= int(getattr(args, "buddy_error_threshold", 2) or 2):
+            target_weight = min(current_weight, int(getattr(args, "buddy_error_cap", 12) or 12))
+            reason = "upstream_error_cap"
+        elif (
+            int(stat.get("ok") or 0) >= int(getattr(args, "buddy_restore_min_ok", 20) or 20)
+            and int(stat.get("scanner_error") or 0) == 0
+            and int(stat.get("upstream_error") or 0) == 0
+        ):
+            target_weight = min(
+                int(getattr(args, "buddy_max_weight", 100) or 100),
+                max(
+                    int(getattr(args, "buddy_healthy_floor", 20) or 20),
+                    current_weight + int(getattr(args, "buddy_restore_step", 4) or 4),
+                ),
+            )
+            reason = "healthy_restore"
+
+        change: dict[str, Any] = {
+            "id": channel_id,
+            "name": channel.get("name"),
+            "current_weight": current_weight,
+            "target_weight": target_weight,
+            "reason": reason,
+            "stats": stat,
+            "applied": False,
+        }
+        if reason not in {"unchanged"} and target_weight != current_weight:
+            if effective_apply(args):
+                full = api_request(args, "GET", f"/api/channel/{channel_id}").get("data") or {}
+                full["weight"] = target_weight
+                response = api_request(args, "PUT", "/api/channel/", json_body=full)
+                change["applied"] = bool(response.get("success"))
+                change["message"] = response.get("message") or ""
+        audits.append(change)
+    return audits
+
+
+def _maintenance_namespace(args: argparse.Namespace, **overrides: Any) -> argparse.Namespace:
+    data = vars(args).copy()
+    data.update(overrides)
+    return argparse.Namespace(**data)
+
+
+def run_channel_maintenance(args: argparse.Namespace) -> dict[str, Any]:
+    now = int(time.time())
+    # Heavy round (option sync only) runs at most once per hour.
+    # Light rounds (every 10 min): quota hold + weight stabilization.
+    # Weight adjustment is read-log-then-write; no upstream probes.
+    heavy_interval = int(getattr(args, "heavy_round_seconds", 3600) or 3600)
+    last_heavy_path = Path("/opt/newapi-maintainer/.last-heavy-round")
+    is_heavy = True
+    try:
+        if last_heavy_path.exists():
+            last_heavy = int(last_heavy_path.read_text().strip() or 0)
+            if now - last_heavy < heavy_interval:
+                is_heavy = False
+    except Exception:
+        pass
+
+    result: dict[str, Any] = {
+        "time": now,
+        "apply": effective_apply(args),
+        "base_url": args.base_url,
+        "round": "heavy" if is_heavy else "light",
+    }
+
+    # --- every round: quota hold + weight stabilization ---
+    try:
+        result["quota_holds"] = hold_quota_channels(_maintenance_namespace(args, channel_id=[], model="", from_logs=True))
+    except Exception as exc:  # noqa: BLE001
+        result["quota_holds_error"] = preview_text(str(exc), limit=500)
+
+    try:
+        result["weight_adjustments"] = stabilize_channel_weights(args)
+    except Exception as exc:  # noqa: BLE001
+        result["weight_adjustments_error"] = preview_text(str(exc), limit=500)
+
+    result["recover"] = {
+        "skipped": True,
+        "reason": "auto_recovery_disabled; use channels recover manually after operator approval",
+    }
+
+    if not is_heavy:
+        return result
+
+    # --- heavy round: option sync only ---
+    try:
+        last_heavy_path.parent.mkdir(parents=True, exist_ok=True)
+        last_heavy_path.write_text(str(now))
+    except Exception:
+        pass
+
+    try:
+        result["option_changes"] = set_soft_disable_profile(args)
+    except Exception as exc:  # noqa: BLE001
+        result["option_error"] = preview_text(str(exc), limit=500)
+
+    return result
+
+def command_channels_maintain(args: argparse.Namespace) -> int:
+    result = run_channel_maintenance(args)
+    emit_and_optionally_log(result, args.json, getattr(args, "json_log", "") or "")
+    return 0
+
+
+def display_name_for_model(model: str) -> str:
+    overrides = {
+        "gpt-5.5": "GPT-5.5",
+        "gpt-5.4": "GPT-5.4",
+        "gpt-5.4-mini": "GPT-5.4-Mini",
+        "gpt-5.4-openai-compact": "GPT-5.4 OpenAI Compact",
+        "gpt-5.5-openai-compact": "GPT-5.5 OpenAI Compact",
+        "gpt-5.3-codex": "GPT-5.3-Codex",
+        "gpt-5.3-codex-spark": "GPT-5.3-Codex Spark",
+        "gpt-5.2": "GPT-5.2",
+        "glm-5.2": "GLM-5.2",
+        "gemini-2.5-flash": "Gemini 2.5 Flash",
+        "deepseek-v4-pro": "DeepSeek V4 Pro",
+        "deepseek-v4-flash": "DeepSeek V4 Flash",
+        "codex-auto-review": "Codex Auto Review",
+        "stepfun-ai/step-3.7-flash": "StepFun Step 3.7 Flash",
+    }
+    if model in overrides:
+        return overrides[model]
+    return model.replace("/", " / ").replace("-", " ").title()
+
+
+def model_description(model: str) -> str:
+    if model.startswith("gpt-"):
+        return "Relay-provided GPT-compatible coding model."
+    if model.startswith("glm-"):
+        return "Relay-provided GLM coding model through NewAPI."
+    if model.startswith("gemini-"):
+        return "Relay-provided Gemini model through NewAPI."
+    if model.startswith("deepseek-"):
+        return "Relay-provided DeepSeek model through NewAPI."
+    return "Relay-provided model exposed by NewAPI."
+
+
+def catalog_template_from_existing(existing: dict[str, Any]) -> dict[str, Any]:
+    models = existing.get("models") if isinstance(existing, dict) else None
+    if isinstance(models, list):
+        for model in models:
+            if isinstance(model, dict) and model.get("slug") == "gpt-5.5":
+                return dict(model)
+        for model in models:
+            if isinstance(model, dict):
+                return dict(model)
+    raise CliError("Codex catalog template has no usable model entries")
+
+
+def build_codex_model_entry(model: str, template: dict[str, Any], priority: int) -> dict[str, Any]:
+    entry = dict(template)
+    entry["slug"] = model
+    entry["display_name"] = display_name_for_model(model)
+    entry["description"] = model_description(model)
+    entry["priority"] = priority
+    entry["visibility"] = "hide" if model == "codex-auto-review" else "list"
+    entry["availability_nux"] = None
+    entry["upgrade"] = None
+    entry["service_tiers"] = []
+    entry["additional_speed_tiers"] = []
+    ctx, _max_out = ContextMeta.resolve(model, for_codex=True)
+    if ctx is None:
+        ctx = 1_048_576  # fallback when OpenRouter unreachable and no override
+    # Ratchet (karma #147): Codex Desktop uses context_window as an async compaction
+    # trigger, not a hard truncation limit. When a CODEX_PRODUCT_OVERRIDE exists
+    # (codex ctx < upstream ctx), verify >=20% headroom for compaction to complete.
+    upstream_ctx, _ = ContextMeta.resolve(model, for_codex=False)
+    min_headroom = int(upstream_ctx * 0.2) if upstream_ctx else 200_000
+    if (
+        upstream_ctx and ctx
+        and ctx < upstream_ctx
+        and (upstream_ctx - ctx) < min_headroom
+    ):
+        sys.stderr.write(
+            f"WARNING: {model} codex context_window={ctx} has only "
+            f"{upstream_ctx - ctx} headroom below upstream limit={upstream_ctx}; "
+            f"need >={min_headroom} for async compaction (karma #147)\n"
+        )
+    entry["context_window"] = ctx
+    entry["max_context_window"] = ctx
+    entry["effective_context_window_percent"] = 95
+    return entry
+
+
+def codex_client_version_triplet() -> str:
+    version_text = "0.140.0"
+    try:
+        proc = subprocess.run(
+            [str(Path(os.environ.get("CODEX_CLI_PATH") or "")) or "codex", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            match = re.search(r"(\d+\.\d+\.\d+)", proc.stdout)
+            if match:
+                version_text = match.group(1)
+    except Exception:
+        pass
+    return version_text
+
+
+def build_codex_models_cache(catalog: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fetched_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "etag": None,
+        "client_version": codex_client_version_triplet(),
+        "models": catalog.get("models", []),
+    }
+
+
+def configured_channel_model_ids(args: argparse.Namespace) -> list[str]:
+    channels = fetch_existing_channels(args)
+    model_ids: list[str] = []
+    for channel in channels:
+        if channel.get("status") != 1 and not getattr(args, "include_disabled", False):
+            continue
+        if getattr(args, "exclude_tag", None) and channel.get("tag") in args.exclude_tag:
+            continue
+        model_ids.extend(split_list(channel.get("models")))
+    return sorted(set(model_ids))
+
+
+def live_newapi_model_ids(args: argparse.Namespace) -> list[str]:
+    data = caller_api_request(args, "GET", "/v1/models")
+    models = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        raise CliError("/v1/models response does not contain a data list")
+    return sorted(
+        {
+            str(item.get("id")).strip()
+            for item in models
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+    )
+
+
+def command_codex_catalog_sync(args: argparse.Namespace) -> int:
+    catalog_path = Path(args.catalog_path).expanduser()
+    if not catalog_path.is_absolute():
+        catalog_path = Path.home() / ".codex" / catalog_path
+    models_cache_path = Path(args.models_cache_path).expanduser()
+    if not models_cache_path.is_absolute():
+        models_cache_path = Path.home() / ".codex" / models_cache_path
+    existing = json.loads(catalog_path.read_text(encoding="utf-8"))
+    template = catalog_template_from_existing(existing)
+    if args.source == "channels":
+        model_ids = configured_channel_model_ids(args)
+    else:
+        model_ids = live_newapi_model_ids(args)
+    if not args.include_hidden:
+        model_ids = [model for model in model_ids if model != "codex-auto-review"]
+    pinned = split_list(args.pin_first)
+    ordered = [model for model in pinned if model in model_ids]
+    ordered.extend(model for model in model_ids if model not in set(ordered))
+    new_catalog = {
+        "models": [
+            build_codex_model_entry(model, template, index * 2)
+            for index, model in enumerate(ordered)
+        ]
+    }
+    new_models_cache = build_codex_models_cache(new_catalog)
+    before = [item.get("slug") for item in existing.get("models", []) if isinstance(item, dict)]
+    after = [item.get("slug") for item in new_catalog["models"]]
+    result = {
+        "dry_run": not effective_apply(args),
+        "catalog_path": str(catalog_path),
+        "models_cache_path": str(models_cache_path),
+        "source": args.source,
+        "before_count": len(before),
+        "after_count": len(after),
+        "added": sorted(set(after) - set(before)),
+        "removed": sorted(set(before) - set(after)),
+        "models": after,
+    }
+    if effective_apply(args):
+        catalog_path.write_text(json.dumps(new_catalog, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        models_cache_path.write_text(
+            json.dumps(new_models_cache, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        result["written"] = True
+    emit(result, args.json)
+    return 0
+
+
+def _sync_pi_models(pi_path: Path, apply: bool) -> dict[str, Any]:
+    """Write contextWindow/maxTokens into ~/.pi/agent/models.json."""
+    config = json.loads(pi_path.read_text(encoding="utf-8"))
+    rows = []
+    changed = 0
+    for prov_name, prov in config.get("providers", {}).items():
+        if not isinstance(prov, dict) or not isinstance(prov.get("models"), list):
+            continue
+        for m in prov["models"]:
+            if not isinstance(m, dict) or not m.get("id"):
+                continue
+            pi_id = m["id"]
+            ctx, max_out = ContextMeta.resolve(pi_id, for_codex=False)
+            old_ctx = m.get("contextWindow")
+            old_max = m.get("maxTokens")
+            if ctx and ctx != old_ctx:
+                m["contextWindow"] = ctx
+            if max_out and max_out != old_max:
+                m["maxTokens"] = max_out
+            if m.get("contextWindow") != old_ctx or m.get("maxTokens") != old_max:
+                changed += 1
+            rows.append({
+                "provider": prov_name,
+                "model": pi_id,
+                "contextWindow": m.get("contextWindow"),
+                "maxTokens": m.get("maxTokens"),
+                "changed": (m.get("contextWindow") != old_ctx or m.get("maxTokens") != old_max),
+            })
+    if apply:
+        pi_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"path": str(pi_path), "total": len(rows), "changed": changed, "models": rows, "written": apply}
+
+
+def _sync_codebuddy_models(cb_path: Path, apply: bool) -> dict[str, Any]:
+    """Write maxInputTokens/maxOutputTokens into ~/.codebuddy/models.json."""
+    config = json.loads(cb_path.read_text(encoding="utf-8"))
+    models = config.get("models") if isinstance(config, dict) else config
+    if not isinstance(models, list):
+        return {"path": str(cb_path), "error": "no models list found"}
+    rows = []
+    changed = 0
+    for m in models:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        cb_id = m["id"]
+        ctx, max_out = ContextMeta.resolve(cb_id, for_codex=False)
+        old_ctx = m.get("maxInputTokens")
+        old_max = m.get("maxOutputTokens")
+        if ctx and ctx != old_ctx:
+            m["maxInputTokens"] = ctx
+        if max_out and max_out != old_max:
+            m["maxOutputTokens"] = max_out
+        if m.get("maxInputTokens") != old_ctx or m.get("maxOutputTokens") != old_max:
+            changed += 1
+        rows.append({
+            "model": cb_id,
+            "maxInputTokens": m.get("maxInputTokens"),
+            "maxOutputTokens": m.get("maxOutputTokens"),
+            "changed": (m.get("maxInputTokens") != old_ctx or m.get("maxOutputTokens") != old_max),
+        })
+    if apply:
+        cb_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"path": str(cb_path), "total": len(rows), "changed": changed, "models": rows, "written": apply}
+
+
+def command_agent_models_sync(args: argparse.Namespace) -> int:
+    apply = effective_apply(args)
+    result: dict[str, Any] = {"dry_run": not apply, "agents": {}}
+    if args.agent in ("pi", "all"):
+        pi_path = Path(args.pi_models_path).expanduser()
+        if pi_path.exists():
+            result["agents"]["pi"] = _sync_pi_models(pi_path, apply)
+        else:
+            result["agents"]["pi"] = {"error": f"not found: {pi_path}"}
+    if args.agent in ("codebuddy", "all"):
+        cb_path = Path(args.codebuddy_models_path).expanduser()
+        if cb_path.exists():
+            result["agents"]["codebuddy"] = _sync_codebuddy_models(cb_path, apply)
+        else:
+            result["agents"]["codebuddy"] = {"error": f"not found: {cb_path}"}
+    emit(result, args.json)
+    return 0
+
+
+def add_common_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--admin-token-cred", default=DEFAULT_ADMIN_TOKEN_CRED)
+    parser.add_argument("--user-id", default=DEFAULT_USER_ID)
+    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--proxy-url", default="", help="Optional HTTP proxy for NewAPI admin requests, e.g. http://127.0.0.1:7890")
+    parser.add_argument("--json", action="store_true")
+
+
+def add_channel_secret_flags(parser: argparse.ArgumentParser, *, required: bool) -> None:
+    group = parser.add_mutually_exclusive_group(required=required)
+    group.add_argument("--api-key-cred", default="", help="Sigil credential containing the upstream API key.")
+    group.add_argument("--key-stdin", action="store_true", help="Read the upstream API key from stdin.")
+
+
+def add_optimizer_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--channel-id", type=int, action="append", default=[], help="Only optimize this channel id; repeatable.")
+    parser.add_argument("--tag", action="append", default=[], help="Optimize channels with this tag; repeatable. Defaults to all tags.")
+    parser.add_argument("--all-tags", action="store_true", help="Ignore tag filters.")
+    parser.add_argument("--model", action="append", default=[], help="Model to optimize for; repeatable. Defaults to all channel models.")
+    add_bool_pair(
+        parser,
+        "per-model",
+        dest="per_model",
+        default=True,
+        help_on="Optimize each model only within channels that expose that same model.",
+        help_off="Use legacy channel-wide optimization across the selected scope.",
+    )
+    parser.add_argument("--include-disabled", action="store_true")
+    parser.add_argument("--target-group", default="default", help="Set matching channels to this group; pass empty string to keep groups.")
+    parser.add_argument("--log-page-size", type=int, default=200)
+    parser.add_argument("--log-pages", type=int, default=1, help="Number of NewAPI log pages to scan. NewAPI may cap each page at 100 rows.")
+    parser.add_argument("--recent-window-seconds", type=int, default=1800, help="Freshness window for treating usage logs as current evidence.")
+    parser.add_argument("--include-admin-tests", action="store_true", help="Count NewAPI admin model-test logs as usage evidence.")
+    parser.add_argument("--probe", action="store_true", help="Run NewAPI native channel tests before scoring.")
+    parser.add_argument("--primary-priority", type=int, default=10)
+    parser.add_argument("--primary-weight", type=int, default=100)
+    add_bool_pair(
+        parser,
+        "explore",
+        dest="explore",
+        default=True,
+        help_on="Keep unproven but enabled channels available as low-weight seeds.",
+        help_off="Do not keep unproven channels as exploration seeds.",
+    )
+    parser.add_argument("--explore-weight", type=int, default=1)
+    parser.add_argument("--min-explore-score", type=float, default=0.5)
+    add_bool_pair(
+        parser,
+        "require-responses-success",
+        dest="require_responses_success",
+        default=True,
+        help_on="Only promote channels with observed /v1/responses success; keeps Responses routes off chat-only channels.",
+        help_off="Allow chat/test-only evidence to promote channels.",
+    )
+    parser.add_argument("--fallback-priority", type=int, default=5)
+    parser.add_argument("--fallback-weight", type=int, default=25)
+    parser.add_argument("--poor-priority", type=int, default=0)
+    parser.add_argument("--poor-weight", type=int, default=1)
+    parser.add_argument("--min-primary-score", type=float, default=0.58)
+    parser.add_argument("--min-fallback-score", type=float, default=0.42)
+    parser.add_argument("--promote-on-recovery", action="store_true", help="Before ranking, run a real SSE probe on any status=1 channel whose priority is below the same-model healthy max; if the probe passes, raise its priority to that max so it competes on the top tier with its existing weight.")
+    parser.add_argument("--promote-probe-prompt", default="ping", help="Prompt used by the recovery probe.")
+    parser.add_argument("--promote-probe-max-tokens", type=int, default=8, help="max_tokens for the recovery probe.")
+    parser.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED, help="Sigil cred for the caller token used when --promote-on-recovery runs the SSE probe through the gateway.")
+    parser.add_argument("--apply-multi-model-channel", action="store_true", help="Allow per-model recommendations to update channel-level priority/weight for channels exposing multiple models. Use only for the automated maintainer where channel-level tradeoffs are intentional.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only. Routing optimizer applies by default unless --dry-run is set.")
+    parser.add_argument("--apply", action="store_true", default=True, help="Actually update NewAPI channel priority/weight fields. This is the channel optimizer default.")
+
+
+def add_bool_pair(parser: argparse.ArgumentParser, name: str, *, dest: str, default: bool | None, help_on: str, help_off: str) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{name}", action="store_true", dest=dest, default=default, help=help_on)
+    group.add_argument(f"--no-{name}", action="store_false", dest=dest, help=help_off)
+
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Manage the personal NewAPI gateway."
+    )
+    add_common_flags(parser)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("doctor", help="Check service and native admin API access.")
+    p.set_defaults(func=command_doctor)
+
+    catalog = sub.add_parser("codex-catalog", help="Sync Codex model catalog from NewAPI models.")
+    catalog_sub = catalog.add_subparsers(dest="codex_catalog_command", required=True)
+
+    p = catalog_sub.add_parser("sync", help="Write Codex model_catalog_json from NewAPI's exposed models.")
+    p.add_argument("--catalog-path", default=str(DEFAULT_CODEX_CATALOG_PATH))
+    p.add_argument("--models-cache-path", default=str(DEFAULT_CODEX_MODELS_CACHE_PATH))
+    p.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED)
+    p.add_argument("--source", choices=["v1-models", "channels"], default="v1-models")
+    p.add_argument("--include-hidden", action="store_true", help="Include hidden operational models such as codex-auto-review.")
+    p.add_argument("--include-disabled", action="store_true", help="When --source channels, include disabled channels.")
+    p.add_argument("--exclude-tag", action="append", default=[], help="When --source channels, skip channels with this tag.")
+    p.add_argument("--pin-first", default="gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex,gpt-5.2,glm-5.2")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_codex_catalog_sync)
+
+    agent_models = sub.add_parser("agent-models", help="Sync agent models.json (pi, codebuddy) context windows from OpenRouter + local overrides.")
+    agent_models_sub = agent_models.add_subparsers(dest="agent_models_command", required=True)
+
+    p = agent_models_sub.add_parser("sync", help="Write contextWindow/maxTokens into pi and codebuddy models.json from OpenRouter metadata.")
+    p.add_argument("--agent", choices=["pi", "codebuddy", "all"], default="all", help="Which agent config to sync.")
+    p.add_argument("--pi-models-path", default=str(Path.home() / ".pi" / "agent" / "models.json"))
+    p.add_argument("--codebuddy-models-path", default=str(Path.home() / ".codebuddy" / "models.json"))
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_agent_models_sync)
+
+    channels = sub.add_parser("channels", help="Manage gateway channels.")
+    channels_sub = channels.add_subparsers(dest="channels_command", required=True)
+
+    p = channels_sub.add_parser("list", help="List channels without revealing upstream keys.")
+    p.add_argument("--page", type=int, default=1)
+    p.add_argument("--page-size", type=int, default=20)
+    p.add_argument("--status", default="")
+    p.add_argument("--type-filter", type=int, default=None)
+    p.add_argument("--group-filter", default="")
+    p.add_argument("--id-sort", action="store_true")
+    p.set_defaults(func=command_channels_list)
+
+    p = channels_sub.add_parser("get", help="Read one channel by id without revealing its upstream key.")
+    p.add_argument("--id", type=int, required=True)
+    p.set_defaults(func=command_channels_get)
+
+    p = channels_sub.add_parser("create", help="Create one upstream channel via NewAPI API.")
+    p.add_argument("--name", required=True)
+    p.add_argument("--upstream-base-url", dest="base_url_value", required=True)
+    add_channel_secret_flags(p, required=True)
+    p.add_argument("--type", default="openai", help="Channel type name or id.")
+    p.add_argument("--models", default=DEFAULT_MODELS)
+    p.add_argument("--group", default="default")
+    p.add_argument("--tag", default="relay-gate")
+    p.add_argument("--priority", type=int, default=0)
+    p.add_argument("--weight", type=int, default=0)
+    p.add_argument("--test-model", default="")
+    p.add_argument("--model-mapping", default="")
+    p.add_argument("--remark", default="")
+    p.add_argument("--status", type=int, default=1)
+    p.add_argument("--auto-ban", type=int, default=1)
+    p.add_argument("--keep-v1", action="store_true", help="Do not strip a trailing /v1 from upstream base_url.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true", help="Actually create the channel.")
+    p.set_defaults(func=command_channels_create)
+
+    p = channels_sub.add_parser("update", help="Update safe channel fields via NewAPI API.")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--name", default=None)
+    p.add_argument("--type", default=None, help="Channel type name or id.")
+    p.add_argument("--upstream-base-url", dest="base_url_value", default=None)
+    p.add_argument("--models", default=None)
+    p.add_argument("--group", default=None)
+    p.add_argument("--tag", default=None)
+    p.add_argument("--priority", type=int, default=None)
+    p.add_argument("--weight", type=int, default=None)
+    p.add_argument("--status", type=int, default=None)
+    p.add_argument("--test-model", default=None)
+    p.add_argument("--model-mapping", default=None)
+    p.add_argument("--status-code-mapping", default=None)
+    p.add_argument("--remark", default=None)
+    p.add_argument("--auto-ban", type=int, default=None)
+    p.add_argument("--other", default=None)
+    p.add_argument("--keep-v1", action="store_true", help="Do not strip a trailing /v1 from upstream base_url.")
+    add_channel_secret_flags(p, required=False)
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true", help="Actually update the channel.")
+    p.set_defaults(func=command_channels_update)
+
+    p = channels_sub.add_parser("test", help="Probe channel health via NewAPI internal test, real relay traffic, or both.")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--model", default="", help="Model to test. Default uses channel.test_model or first models entry. Use '*' to test every configured model.")
+    p.add_argument("--via", choices=["newapi", "relay", "both"], default="both", help="newapi: NewAPI's internal /api/channel/test against this channel id. relay: real streaming /v1/chat/completions through the gateway model router, SSE-aware but not channel-pinned. both: run both and require either to pass.")
+    p.add_argument("--stream", action="store_true", help="Pass stream=true to NewAPI's channel test. Use for SSE-capable upstreams and disabled-channel recovery probes.")
+    p.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED, help="Sigil cred for the caller token used in --via relay/both.")
+    p.set_defaults(func=command_channels_test)
+
+    p = channels_sub.add_parser("hold-quota", help="Manually hold quota-exhausted channels until a pinned stream test succeeds.")
+    p.add_argument("--channel-id", type=int, action="append", default=[], help="Channel id to hold; repeatable.")
+    p.add_argument("--model", default="", help="Probe model override when a channel id needs live quota confirmation.")
+    p.add_argument("--from-logs", action="store_true", help="Also scan recent logs for quota-exhausted Buddy/WorkBuddy failures.")
+    p.add_argument("--log-page-size", type=int, default=100)
+    p.add_argument("--log-pages", type=int, default=5)
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_channels_hold_quota)
+
+    p = channels_sub.add_parser("recover", help="Recover disabled or quota-held channels only after a pinned stream channel-test passes.")
+    p.add_argument("--channel-id", type=int, action="append", default=[], help="Channel id to recover; repeatable.")
+    p.add_argument("--model", default="", help="Probe model override.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_channels_recover)
+
+    models = channels_sub.add_parser("models", help="List or configure channel model exposure.")
+    models_sub = models.add_subparsers(dest="channel_models_command", required=True)
+
+    p = models_sub.add_parser("list", help="List configured models for channels.")
+    p.add_argument("--channel-id", type=int, action="append", default=[], help="Only include this channel id; repeatable.")
+    p.add_argument("--tag", action="append", default=[], help="Only include channels with this tag; repeatable.")
+    p.add_argument("--include-disabled", action="store_true")
+    p.set_defaults(func=command_channel_models_list)
+
+    p = models_sub.add_parser("set", help="Set one channel's models/test model/model mapping.")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--models", default=None, help="Comma-separated model names to expose on this NewAPI channel.")
+    p.add_argument("--test-model", default=None)
+    p.add_argument("--model-mapping", default=None, help="JSON object or alias=actual comma list.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_channel_models_set)
+
+    p = channels_sub.add_parser("optimize", help="Recommend or apply NewAPI channel priority and weight from logs/tests.")
+    add_optimizer_flags(p)
+    p.set_defaults(func=command_channels_optimize)
+
+    p = channels_sub.add_parser("maintain", help="Run one NewAPI maintenance round: soft options, quota holds, stream recovery, optimizer, and Buddy damping.")
+    p.add_argument("--log-page-size", type=int, default=100)
+    p.add_argument("--log-pages", type=int, default=10)
+    p.add_argument("--recent-window-seconds", type=int, default=21600)
+    p.add_argument("--primary-priority", type=int, default=10)
+    p.add_argument("--primary-weight", type=int, default=100)
+    p.add_argument("--promote-probe-prompt", default="ping")
+    p.add_argument("--promote-probe-max-tokens", type=int, default=8)
+    p.add_argument("--buddy-window-seconds", type=int, default=10800)
+    p.add_argument("--buddy-scanner-cap", type=int, default=8)
+    p.add_argument("--buddy-error-cap", type=int, default=12)
+    p.add_argument("--buddy-error-threshold", type=int, default=2)
+    p.add_argument("--buddy-restore-min-ok", type=int, default=20)
+    p.add_argument("--buddy-restore-step", type=int, default=4)
+    p.add_argument("--buddy-healthy-floor", type=int, default=20)
+    p.add_argument("--buddy-max-weight", type=int, default=40)
+    p.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED)
+    p.add_argument("--json-log", default="", help="Write the maintenance JSON result to this file.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_channels_maintain)
+
+    bridge = sub.add_parser("responses-bridge", help="Read or ensure the global Responses→ChatCompletions bridge policy.")
+    bridge_sub = bridge.add_subparsers(dest="responses_bridge_command", required=True)
+
+    p = bridge_sub.add_parser("get", help="Read the current global Responses→ChatCompletions policy.")
+    p.set_defaults(func=command_responses_bridge_get)
+
+    p = bridge_sub.add_parser("ensure", help="Enable bridge scope for listed channels/models without dropping existing entries.")
+    p.add_argument("--channel-id", type=int, action="append", default=[], help="Channel id to include; repeatable.")
+    p.add_argument("--model-pattern", action="append", default=[], help="Regex to include; repeatable.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_responses_bridge_ensure)
+
+    tokens = sub.add_parser("tokens", help="Manage NewAPI caller tokens.")
+    tokens_sub = tokens.add_subparsers(dest="tokens_command", required=True)
+
+    p = tokens_sub.add_parser("list", help="List caller tokens without revealing keys.")
+    p.add_argument("--keyword", default="")
+    p.add_argument("--page", type=int, default=1)
+    p.add_argument("--page-size", type=int, default=20)
+    p.set_defaults(func=command_tokens_list)
+
+    p = tokens_sub.add_parser("get", help="Read one caller token without revealing its key.")
+    p.add_argument("--id", type=int, required=True)
+    p.set_defaults(func=command_tokens_get)
+
+    p = tokens_sub.add_parser("create", help="Create one NewAPI caller token.")
+    p.add_argument("--name", required=True)
+    p.add_argument("--group", default="default")
+    p.add_argument("--expired-time", type=int, default=-1)
+    p.add_argument("--remain-quota", type=int, default=500000)
+    add_bool_pair(
+        p,
+        "unlimited",
+        dest="unlimited",
+        default=False,
+        help_on="Create the token with unlimited quota.",
+        help_off="Create the token with finite quota.",
+    )
+    add_bool_pair(
+        p,
+        "model-limits-enabled",
+        dest="model_limits_enabled",
+        default=False,
+        help_on="Enable token model allow-list.",
+        help_off="Disable token model allow-list.",
+    )
+    p.add_argument("--model-limits", default="")
+    p.add_argument("--allow-ips", default="")
+    add_bool_pair(
+        p,
+        "cross-group-retry",
+        dest="cross_group_retry",
+        default=False,
+        help_on="Allow NewAPI cross-group retry for this token.",
+        help_off="Disable NewAPI cross-group retry for this token.",
+    )
+    p.add_argument("--store-cred", default="", help="Store generated key into this Sigil credential after --apply.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_tokens_create)
+
+    p = tokens_sub.add_parser("update", help="Update safe caller token fields.")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--name", default=None)
+    p.add_argument("--status", type=int, default=None)
+    p.add_argument("--expired-time", type=int, default=None)
+    p.add_argument("--remain-quota", type=int, default=None)
+    add_bool_pair(
+        p,
+        "unlimited",
+        dest="unlimited",
+        default=None,
+        help_on="Set unlimited quota.",
+        help_off="Set finite quota.",
+    )
+    add_bool_pair(
+        p,
+        "model-limits-enabled",
+        dest="model_limits_enabled",
+        default=None,
+        help_on="Enable token model allow-list.",
+        help_off="Disable token model allow-list.",
+    )
+    p.add_argument("--model-limits", default=None)
+    p.add_argument("--allow-ips", default=None)
+    p.add_argument("--group", default=None)
+    add_bool_pair(
+        p,
+        "cross-group-retry",
+        dest="cross_group_retry",
+        default=None,
+        help_on="Allow NewAPI cross-group retry for this token.",
+        help_off="Disable NewAPI cross-group retry for this token.",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_tokens_update)
+
+    p = tokens_sub.add_parser("key", help="Regenerate/read a caller token key and optionally store it in Sigil.")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--store-cred", default="")
+    p.set_defaults(func=command_tokens_key)
+
+    p = tokens_sub.add_parser("ensure-self", help="Ensure the default self-use caller token and store its key.")
+    p.add_argument("--name", default="l1uyun-general-cli")
+    p.add_argument("--group", default="default")
+    p.add_argument("--remain-quota", type=int, default=500000)
+    add_bool_pair(
+        p,
+        "unlimited",
+        dest="unlimited",
+        default=True,
+        help_on="Use unlimited quota.",
+        help_off="Use finite quota.",
+    )
+    p.add_argument("--allow-ips", default="")
+    add_bool_pair(
+        p,
+        "cross-group-retry",
+        dest="cross_group_retry",
+        default=False,
+        help_on="Allow NewAPI cross-group retry for this token.",
+        help_off="Disable NewAPI cross-group retry for this token.",
+    )
+    add_bool_pair(
+        p,
+        "store",
+        dest="store",
+        default=True,
+        help_on="Store generated key in Sigil.",
+        help_off="Do not store generated key.",
+    )
+    p.add_argument("--cred-name", default=DEFAULT_GENERAL_TOKEN_CRED)
+    p.set_defaults(func=command_tokens_ensure_self)
+
+    logs = sub.add_parser("logs", help="Read NewAPI usage/admin logs without secrets.")
+    logs_sub = logs.add_subparsers(dest="logs_command", required=True)
+
+    p = logs_sub.add_parser("recent", help="Read recent logs for channel/model/token diagnosis.")
+    p.add_argument("--page", type=int, default=1)
+    p.add_argument("--page-size", type=int, default=20)
+    p.add_argument("--self", action="store_true", help="Use /api/log/self instead of admin-wide /api/log/.")
+    p.add_argument("--include-other", action="store_true", help="Include parsed log metadata instead of only a preview.")
+    p.set_defaults(func=command_logs_recent)
+
+    p = logs_sub.add_parser("stats", help="Read aggregate NewAPI log stats.")
+    p.set_defaults(func=command_logs_stats)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except requests.RequestException as exc:
+        print(f"network error: {exc}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
