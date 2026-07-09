@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import time
@@ -17,6 +18,16 @@ def load_relay_gate():
 
 
 class RoutingProposalTest(unittest.TestCase):
+
+    def test_channels_optimize_defaults_to_preview(self):
+        mod = load_relay_gate()
+        parser = mod.build_parser()
+        args = parser.parse_args(["--json", "channels", "optimize"])
+
+        self.assertEqual(args.func, mod.command_channels_optimize)
+        self.assertFalse(args.apply)
+        self.assertFalse(args.dry_run)
+        self.assertFalse(mod.effective_apply(args))
     def test_sigil_helper_path_points_to_agentwork_tool_source(self):
         mod = load_relay_gate()
 
@@ -81,6 +92,351 @@ class RoutingProposalTest(unittest.TestCase):
                 self.assertEqual(entry["supported_reasoning_levels"], template["supported_reasoning_levels"])
                 self.assertTrue(entry["supports_reasoning_summaries"])
 
+    def test_codex_catalog_models_command_reads_only_v1_models(self):
+        mod = load_relay_gate()
+        calls = []
+        emitted = []
+
+        def fake_caller_api_request(args, method, path, *, json_body=None):
+            calls.append((method, path, json_body))
+            return {
+                "data": [
+                    {"id": "glm-5.2"},
+                    {"id": "deepseek-v4-pro"},
+                    {"id": "glm-5.2"},
+                    {"id": ""},
+                    {"object": "model"},
+                ]
+            }
+
+        old_caller_api_request = mod.caller_api_request
+        old_emit = mod.emit
+        try:
+            mod.caller_api_request = fake_caller_api_request
+            mod.emit = lambda data, as_json: emitted.append(data)
+            args = argparse.Namespace(json=True)
+
+            self.assertEqual(mod.command_codex_catalog_models(args), 0)
+        finally:
+            mod.caller_api_request = old_caller_api_request
+            mod.emit = old_emit
+
+        self.assertEqual(calls, [("GET", "/v1/models", None)])
+        self.assertEqual(emitted, [{"source": "v1-models", "count": 2, "models": ["deepseek-v4-pro", "glm-5.2"]}])
+
+    def test_codex_catalog_models_parser_does_not_require_catalog_paths(self):
+        mod = load_relay_gate()
+        parser = mod.build_parser()
+
+        args = parser.parse_args(["--json", "codex-catalog", "models"])
+
+        self.assertEqual(args.func, mod.command_codex_catalog_models)
+        self.assertEqual(args.source, "v1-models")
+        self.assertTrue(args.json)
+
+    def test_missing_model_overrides_match_provider_surfaces(self):
+        mod = load_relay_gate()
+        template = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "description": "template",
+            "context_window": 256000,
+            "max_context_window": 256000,
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+            "input_modalities": ["text", "image"],
+            "supports_parallel_tool_calls": True,
+        }
+
+        expected = {
+            "gpt-5.6-sol": (372000, "low", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+            "gpt-5.6-terra": (372000, "medium", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+            "gpt-5.6-luna": (372000, "medium", ["low", "medium", "high", "xhigh", "max"]),
+            "grok-4.5": (500000, "medium", ["low", "medium", "high"]),
+            "grok-4.3": (1000000, "medium", ["none", "low", "medium", "high"]),
+            "grok-3-mini": (1000000, "medium", ["none", "low", "medium", "high"]),
+            "grok-3-mini-fast": (1000000, "medium", ["none", "low", "medium", "high"]),
+            "workbuddy-glm-5.2": (400000, "high", ["none", "high"]),
+        }
+
+        for model, (context_window, default_effort, efforts) in expected.items():
+            with self.subTest(model=model):
+                entry = mod.build_codex_model_entry(model, template, 0)
+                self.assertEqual(entry["context_window"], context_window)
+                self.assertEqual(entry["max_context_window"], context_window)
+                self.assertEqual(entry["default_reasoning_level"], default_effort)
+                self.assertEqual([item["effort"] for item in entry["supported_reasoning_levels"]], efforts)
+
+        sol = mod.build_codex_model_entry("gpt-5.6-sol", template, 0)
+        terra = mod.build_codex_model_entry("gpt-5.6-terra", template, 0)
+        luna = mod.build_codex_model_entry("gpt-5.6-luna", template, 0)
+        self.assertEqual(luna["visibility"], "hide")
+        self.assertEqual(sol["multi_agent_version"], "v2")
+        self.assertEqual(terra["multi_agent_version"], "v2")
+        self.assertEqual(luna["multi_agent_version"], "v1")
+
+    def test_codexplusplus_projection_updates_active_profile(self):
+        mod = load_relay_gate()
+        settings = {
+            "activeRelayId": "relay-gate",
+            "relayProfiles": [
+                {"id": "other", "modelList": "old", "configContents": "model = \"old\"\n"},
+                {"id": "relay-gate", "modelList": "old", "configContents": "model = \"glm-5.2\"\n"},
+            ],
+        }
+
+        result = mod.project_codexplusplus_settings(settings, ["gpt-5.6-sol", "grok-4.5"])
+
+        self.assertEqual(settings["relayProfiles"][0]["modelList"], "old")
+        profile = settings["relayProfiles"][1]
+        self.assertEqual(profile["modelList"], "gpt-5.6-sol\ngrok-4.5")
+        self.assertIn('model_catalog_json = "cc-switch-model-catalog.json"', profile["configContents"])
+        self.assertEqual(result["profile_id"], "relay-gate")
+        self.assertEqual(result["repairs"], ["modelList", "configContents"])
+
+    def test_codex_catalog_task_command_runs_relay_gate_directly(self):
+        mod = load_relay_gate()
+
+        command = mod.build_codex_catalog_task_action(
+            executable=Path(r"D:\Python3.11.1\Scripts\relay-gate.exe"),
+            log_path=Path(r"C:\Users\84618\AppData\Local\RelayGate\codex-catalog-sync.json"),
+        )
+
+        self.assertTrue(command.startswith('"D:\\Python3.11.1\\Scripts\\relay-gate.exe" --json codex-catalog sync --apply'))
+        self.assertIn('--log-path "C:\\Users\\84618\\AppData\\Local\\RelayGate\\codex-catalog-sync.json"', command)
+        self.assertNotIn("powershell", command.lower())
+        self.assertNotIn("wscript", command.lower())
+    def test_codex_catalog_sync_synthesizes_missing_models_and_updates_plus_settings(self):
+        mod = load_relay_gate()
+        template = {
+            "slug": "gpt-5.5",
+            "model": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "description": "template",
+            "base_instructions": "base",
+            "context_window": 256000,
+            "max_context_window": 256000,
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "input_modalities": ["text", "image"],
+            "supports_parallel_tool_calls": True,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_path = root / "config.toml"
+            catalog_path = root / "catalog.json"
+            cache_path = root / "models_cache.json"
+            plus_path = root / "settings.json"
+            db_path = root / "cc-switch.db"
+            pi_path = root / "pi-models.json"
+            pi_cache_path = root / "pi-model-cache.json"
+            codebuddy_path = root / "codebuddy-models.json"
+            config_path.write_text('model = "gpt-5.5"\n[model_providers.custom]\nbase_url = "https://example.test/v1"\n', encoding="utf-8")
+            catalog_path.write_text(json.dumps({"models": [template]}), encoding="utf-8")
+            cache_path.write_text(json.dumps({"models": [template]}), encoding="utf-8")
+            plus_path.write_text(json.dumps({"relayProfiles": [{"id": "relay", "modelList": "", "configContents": "model = \"gpt-5.5\"\n"}]}), encoding="utf-8")
+            pi_path.write_text(json.dumps({"providers": {"newapi": {"models": [{"id": "gpt-5.5", "reasoning": True}], "apiKey": "pi-secret"}}}), encoding="utf-8")
+            codebuddy_path.write_text(json.dumps({"models": [{"id": "gpt-5.5", "apiKey": "cb-secret", "url": "https://example.test/v1/chat/completions"}], "availableModels": ["gpt-5.5"]}), encoding="utf-8")
+            db = sqlite3.connect(db_path)
+            try:
+                db.execute("create table providers (app_type text, is_current integer, settings_config text)")
+                db.execute(
+                    "insert into providers values (?, ?, ?)",
+                    (
+                        "codex",
+                        1,
+                        json.dumps({"config": 'model = "gpt-5.5"\n[model_providers.custom]\nbase_url = "https://example.test/v1"\n', "modelCatalog": {"models": [{"model": "gpt-5.6-sol", "displayName": "Sol local", "contextWindow": 1}]}}),
+                    ),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            emitted = []
+            old_live = mod.live_newapi_model_ids
+            old_emit = mod.emit_and_optionally_log
+            try:
+                mod.live_newapi_model_ids = lambda _args: ["gpt-5.5", "gpt-5.6-sol"]
+                mod.emit_and_optionally_log = lambda data, as_json, json_log="": emitted.append(data)
+                args = argparse.Namespace(
+                    config_path=str(config_path),
+                    catalog_path=str(catalog_path),
+                    models_cache_path=str(cache_path),
+                    codex_plus_plus_settings_path=str(plus_path),
+                    cc_switch_db_path=str(db_path),
+                    caller_token_cred="unused",
+                    source="v1-models",
+                    include_hidden=False,
+                    include_disabled=False,
+                    exclude_tag=[],
+                    pin_first="gpt-5.5",
+                    sync_codex_plus_plus=True,
+                    sync_config=True,
+                    sync_agent_models=True,
+                    pi_models_path=str(pi_path),
+                    pi_models_cache_path=str(pi_cache_path),
+                    codebuddy_models_path=str(codebuddy_path),
+                    log_path="",
+                    dry_run=False,
+                    apply=True,
+                    json=True,
+                )
+                self.assertEqual(mod.command_codex_catalog_sync(args), 0)
+            finally:
+                mod.live_newapi_model_ids = old_live
+                mod.emit_and_optionally_log = old_emit
+
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            sol = next(item for item in catalog["models"] if item["slug"] == "gpt-5.6-sol")
+            self.assertEqual(sol["context_window"], 372000)
+            self.assertEqual([item["effort"] for item in sol["supported_reasoning_levels"]][-2:], ["max", "ultra"])
+            self.assertEqual(sol["base_instructions"], "base")
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            self.assertIn("fetched_at", cache)
+            self.assertIn("client_version", cache)
+            self.assertEqual([item["slug"] for item in cache["models"]], ["gpt-5.5", "gpt-5.6-sol"])
+            self.assertIn('model_catalog_json = "cc-switch-model-catalog.json"', config_path.read_text(encoding="utf-8"))
+            db = sqlite3.connect(db_path)
+            try:
+                settings = json.loads(db.execute("select settings_config from providers where is_current=1").fetchone()[0])
+            finally:
+                db.close()
+            self.assertIn('model_catalog_json = "cc-switch-model-catalog.json"', settings["config"])
+            plus = json.loads(plus_path.read_text(encoding="utf-8"))
+            self.assertEqual(plus["relayProfiles"][0]["modelList"], "gpt-5.5\ngpt-5.6-sol")
+            self.assertTrue(emitted[0]["codex_plus_plus"]["written"])
+            self.assertEqual([item["id"] for item in json.loads(pi_path.read_text(encoding="utf-8"))["providers"]["newapi"]["models"]], ["gpt-5.5", "gpt-5.6-sol"])
+            self.assertEqual(json.loads(codebuddy_path.read_text(encoding="utf-8"))["availableModels"], ["gpt-5.5", "gpt-5.6-sol"])
+            self.assertTrue(emitted[0]["agent_models"]["agents"]["pi"]["written"])
+
+    def test_codex_catalog_task_parser_uses_cli_task_manager(self):
+        mod = load_relay_gate()
+        parser = mod.build_parser()
+
+        args = parser.parse_args(["--json", "codex-catalog", "task", "install", "--interval-minutes", "7", "--dry-run"])
+
+        self.assertEqual(args.func, mod.command_codex_catalog_task)
+        self.assertEqual(args.task_action, "install")
+        self.assertEqual(args.interval_minutes, 7)
+        self.assertTrue(args.dry_run)
+    def test_task_install_ends_existing_task_before_replace(self):
+        mod = load_relay_gate()
+        calls = []
+        emitted = []
+
+        class Result:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        old_run = mod.subprocess.run
+        old_emit = mod.emit
+        try:
+            mod.subprocess.run = lambda command, **_kwargs: calls.append(command) or Result()
+            mod.emit = lambda data, as_json: emitted.append(data)
+            args = argparse.Namespace(
+                task_action="install",
+                task_name="CodexModelMenuCacheWatcher",
+                interval_minutes=5,
+                executable=r"D:\Python3.11.1\Scripts\relay-gate.exe",
+                log_path=r"C:\Temp\catalog.json",
+                dry_run=False,
+                apply=True,
+                json=True,
+            )
+            self.assertEqual(mod.command_codex_catalog_task(args), 0)
+        finally:
+            mod.subprocess.run = old_run
+            mod.emit = old_emit
+
+        self.assertEqual(calls[0][:4], ["schtasks.exe", "/End", "/TN", "CodexModelMenuCacheWatcher"])
+        self.assertEqual(calls[1][0:2], ["schtasks.exe", "/Create"])
+        self.assertEqual(emitted[0]["returncode"], 0)
+    def test_emit_log_creates_parent_directory(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "nested" / "sync.json"
+            mod.emit_and_optionally_log({"ok": True}, False, str(path))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"ok": True})
+    def test_codex_catalog_sync_does_not_rewrite_current_files(self):
+        mod = load_relay_gate()
+        template = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "description": "template",
+            "base_instructions": "base",
+            "context_window": 256000,
+            "max_context_window": 256000,
+            "supported_reasoning_levels": [{"effort": "low"}],
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+        }
+        current = mod.build_projected_codex_catalog({"models": [template]}, {"models": [template]}, ["gpt-5.5"], {})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_path = root / "config.toml"
+            catalog_path = root / "catalog.json"
+            cache_path = root / "cache.json"
+            catalog_path.write_text(json.dumps(current), encoding="utf-8")
+            cache_path.write_text(json.dumps(mod.build_codex_models_cache(current)), encoding="utf-8")
+            writes = []
+            emitted = []
+            old_live = mod.live_newapi_model_ids
+            old_write = mod.write_json_atomic
+            old_emit = mod.emit_and_optionally_log
+            try:
+                mod.live_newapi_model_ids = lambda _args: ["gpt-5.5"]
+                mod.write_json_atomic = lambda path, payload: writes.append((path, payload))
+                mod.emit_and_optionally_log = lambda data, as_json, json_log="": emitted.append(data)
+                args = argparse.Namespace(
+                    config_path=str(config_path), catalog_path=str(catalog_path), models_cache_path=str(cache_path),
+                    codex_plus_plus_settings_path=str(root / "missing.json"), cc_switch_db_path=str(root / "missing.db"),
+                    caller_token_cred="unused", source="v1-models", include_hidden=False, include_disabled=False,
+                    exclude_tag=[], pin_first="gpt-5.5", sync_codex_plus_plus=False, sync_config=False, log_path="",
+                    dry_run=False, apply=True, json=True,
+                )
+                self.assertEqual(mod.command_codex_catalog_sync(args), 0)
+            finally:
+                mod.live_newapi_model_ids = old_live
+                mod.write_json_atomic = old_write
+                mod.emit_and_optionally_log = old_emit
+
+            self.assertEqual(writes, [])
+            self.assertFalse(emitted[0]["written"])
+
+    def test_codex_client_version_uses_resolved_codex_executable(self):
+        mod = load_relay_gate()
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = "OpenAI Codex v0.142.5\n"
+            stderr = ""
+
+        old_env = dict(mod.os.environ)
+        old_run = mod.subprocess.run
+        old_which = mod.shutil.which
+        try:
+            mod.os.environ.pop("CODEX_CLI_PATH", None)
+            mod.shutil.which = lambda name: r"C:\Tools\codex.exe" if name == "codex" else None
+            mod.subprocess.run = lambda command, **_kwargs: calls.append(command) or Result()
+            self.assertEqual(mod.codex_client_version_triplet(), "0.142.5")
+        finally:
+            mod.subprocess.run = old_run
+            mod.shutil.which = old_which
+            mod.os.environ.clear()
+            mod.os.environ.update(old_env)
+
+        self.assertEqual(calls[0], [r"C:\Tools\codex.exe", "--version"])
+    def test_codexplusplus_projection_excludes_quarantined_models(self):
+        mod = load_relay_gate()
+        settings = {"relayProfiles": [{"id": "relay", "modelList": "", "configContents": ""}]}
+
+        selectable = mod.selectable_codex_model_ids(["gpt-5.6-sol", "gpt-5.6-luna", "grok-4.5"])
+        mod.project_codexplusplus_settings(settings, selectable)
+
+        self.assertEqual(selectable, ["gpt-5.6-sol", "grok-4.5"])
+        self.assertEqual(settings["relayProfiles"][0]["modelList"], "gpt-5.6-sol\ngrok-4.5")
     def test_reveal_credential_requires_explicit_env_prefix_for_process_env(self):
         mod = load_relay_gate()
 
@@ -1139,6 +1495,8 @@ class ChannelMaintenanceTest(unittest.TestCase):
             if method == "PUT" and path == "/api/channel/":
                 updates.append(json_body)
                 return {"success": True, "message": ""}
+            if method == "POST" and path.startswith("/api/channel/") and path.endswith("/status"):
+                return {"success": True, "message": ""}
             raise AssertionError((method, path, params))
 
         def fake_probe(_args, channel_id, model, *, stream=False):
@@ -1161,7 +1519,7 @@ class ChannelMaintenanceTest(unittest.TestCase):
         self.assertEqual(probes, [{"channel_id": 10, "model": "buddy-glm5.2", "stream": True}])
         self.assertEqual([item["reason"] for item in result["results"]], ["probe_passed_recovered", "manual_disabled_not_quota_hold"])
         self.assertEqual(len(updates), 1)
-        self.assertEqual(updates[0]["status"], 1)
+        self.assertNotIn("status", updates[0])
         self.assertNotIn("relay_gate_quota_hold", json.loads(updates[0]["other_info"]))
 
     def test_hold_quota_can_use_direct_probe_without_recent_log(self):
@@ -1188,6 +1546,8 @@ class ChannelMaintenanceTest(unittest.TestCase):
             if method == "PUT" and path == "/api/channel/":
                 updates.append(json_body)
                 return {"success": True, "message": ""}
+            if method == "POST" and path.startswith("/api/channel/") and path.endswith("/status"):
+                return {"success": True, "message": ""}
             raise AssertionError((method, path, params))
 
         def fake_probe(_args, channel_id, model, *, stream=False):
@@ -1210,10 +1570,157 @@ class ChannelMaintenanceTest(unittest.TestCase):
         self.assertEqual(probes, [{"channel_id": 10, "model": "buddy-glm5.2", "stream": True}])
         self.assertTrue(result["results"][0]["ok"])
         self.assertEqual(len(updates), 1)
-        self.assertEqual(updates[0]["status"], 2)
+        self.assertNotIn("status", updates[0])
         self.assertEqual(json.loads(updates[0]["other_info"])["relay_gate_quota_hold"]["reason"], mod.QUOTA_HOLD_REASON)
 
     def test_quota_detector_handles_escaped_chinese_error_payload(self):
         mod = load_relay_gate()
         message = r'upstream error: {"data":{"code":14018,"msg":"\u989d\u5ea6\u5df2\u7528\u5c3d\uff0c\u8bf7\u5145\u503c\u540e\u91cd\u8bd5"}}'
         self.assertTrue(mod.is_quota_exhausted_message(message))
+
+    def test_agent_visible_model_ids_follow_catalog_visibility(self):
+        mod = load_relay_gate()
+        catalog = {
+            "models": [
+                {"slug": "gpt-5.6-sol", "visibility": "list"},
+                {"slug": "gpt-5.6-luna", "visibility": "hide"},
+                {"slug": "grok-4.5"},
+            ]
+        }
+
+        self.assertEqual(mod.agent_visible_model_ids(catalog), ["gpt-5.6-sol", "grok-4.5"])
+
+    def test_sync_pi_models_reconciles_newapi_only_and_preserves_provider_config(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.json"
+            path.write_text(json.dumps({
+                "providers": {
+                    "chat2api": {
+                        "api": "openai-completions",
+                        "apiKey": "chat-secret",
+                        "models": [{"id": "keep-chat", "contextWindow": 10, "maxTokens": 2}],
+                    },
+                    "newapi": {
+                        "api": "openai-completions",
+                        "apiKey": "newapi-secret",
+                        "baseUrl": "https://example.test/v1",
+                        "models": [
+                            {"id": "retired-model", "reasoning": False, "contextWindow": 10, "maxTokens": 2},
+                            {"id": "gpt-5.5", "reasoning": True, "contextWindow": 20, "maxTokens": 4},
+                        ],
+                    },
+                }
+            }), encoding="utf-8")
+            old_resolve = mod.ContextMeta.resolve
+            try:
+                mod.ContextMeta.resolve = classmethod(
+                    lambda cls, model_id, for_codex=False: ((256000, 128000) if model_id == "gpt-5.5" else (372000, 128000))
+                )
+                result = mod._sync_pi_models(path, ["gpt-5.5", "gpt-5.6-sol"], True)
+            finally:
+                mod.ContextMeta.resolve = old_resolve
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([item["id"] for item in saved["providers"]["chat2api"]["models"]], ["keep-chat"])
+            self.assertEqual(saved["providers"]["newapi"]["apiKey"], "newapi-secret")
+            self.assertEqual(saved["providers"]["newapi"]["baseUrl"], "https://example.test/v1")
+            self.assertEqual([item["id"] for item in saved["providers"]["newapi"]["models"]], ["gpt-5.5", "gpt-5.6-sol"])
+            self.assertEqual(saved["providers"]["newapi"]["models"][1]["contextWindow"], 372000)
+            self.assertTrue(saved["providers"]["newapi"]["models"][1]["reasoning"])
+            self.assertEqual(result["added"], ["gpt-5.6-sol"])
+            self.assertEqual(result["removed"], ["retired-model"])
+            self.assertNotIn("newapi-secret", json.dumps(result))
+
+    def test_sync_pi_models_refreshes_servitor_model_cache(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "models.json"
+            cache_path = root / "pi_models.json"
+            path.write_text(json.dumps({
+                "providers": {
+                    "chat2api": {"models": [{"id": "keep-chat"}]},
+                    "newapi": {"models": [{"id": "gpt-5.5", "reasoning": True}]},
+                }
+            }), encoding="utf-8")
+            cache_path.write_text(json.dumps(["newapi/retired-model"]), encoding="utf-8")
+            old_resolve = mod.ContextMeta.resolve
+            try:
+                mod.ContextMeta.resolve = classmethod(lambda cls, model_id, for_codex=False: (256000, 128000))
+                result = mod._sync_pi_models(path, ["gpt-5.5"], True, cache_path=cache_path)
+            finally:
+                mod.ContextMeta.resolve = old_resolve
+
+            self.assertEqual(
+                json.loads(cache_path.read_text(encoding="utf-8")),
+                ["chat2api/keep-chat", "newapi/gpt-5.5"],
+            )
+            self.assertTrue(result["cache_written"])
+
+    def test_sync_codebuddy_models_reconciles_allowed_set_and_preserves_credentials(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.json"
+            path.write_text(json.dumps({
+                "models": [{
+                    "id": "gpt-5.5",
+                    "name": "GPT-5.5",
+                    "vendor": "OpenAI",
+                    "apiKey": "codebuddy-secret",
+                    "url": "https://example.test/v1/chat/completions",
+                    "maxInputTokens": 20,
+                    "maxOutputTokens": 4,
+                    "supportsToolCall": True,
+                    "supportsImages": True,
+                    "supportsReasoning": True,
+                }],
+                "availableModels": ["gpt-5.5"],
+            }), encoding="utf-8")
+            old_resolve = mod.ContextMeta.resolve
+            try:
+                mod.ContextMeta.resolve = classmethod(
+                    lambda cls, model_id, for_codex=False: ((256000, 128000) if model_id == "gpt-5.5" else (372000, 128000))
+                )
+                result = mod._sync_codebuddy_models(path, ["gpt-5.5", "gpt-5.6-sol"], True)
+            finally:
+                mod.ContextMeta.resolve = old_resolve
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["availableModels"], ["gpt-5.5", "gpt-5.6-sol"])
+            self.assertEqual([item["id"] for item in saved["models"]], saved["availableModels"])
+            self.assertEqual(saved["models"][1]["apiKey"], "codebuddy-secret")
+            self.assertEqual(saved["models"][1]["url"], "https://example.test/v1/chat/completions")
+            self.assertEqual(saved["models"][1]["vendor"], "OpenAI")
+            self.assertEqual(saved["models"][1]["maxInputTokens"], 372000)
+            self.assertEqual(result["added"], ["gpt-5.6-sol"])
+            self.assertNotIn("codebuddy-secret", json.dumps(result))
+
+    def test_sync_codebuddy_models_repairs_available_models_only(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.json"
+            path.write_text(json.dumps({
+                "models": [{
+                    "id": "gpt-5.5",
+                    "name": "GPT-5.5",
+                    "vendor": "OpenAI",
+                    "apiKey": "codebuddy-secret",
+                    "url": "https://example.test/v1/chat/completions",
+                    "maxInputTokens": 256000,
+                    "maxOutputTokens": 128000,
+                    "supportsToolCall": True,
+                    "supportsImages": True,
+                    "supportsReasoning": True,
+                }],
+                "availableModels": [],
+            }), encoding="utf-8")
+            old_resolve = mod.ContextMeta.resolve
+            try:
+                mod.ContextMeta.resolve = classmethod(lambda cls, model_id, for_codex=False: (256000, 128000))
+                result = mod._sync_codebuddy_models(path, ["gpt-5.5"], True)
+            finally:
+                mod.ContextMeta.resolve = old_resolve
+
+            self.assertTrue(result["written"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["availableModels"], ["gpt-5.5"])

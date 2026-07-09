@@ -14,6 +14,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import sqlite3
+import tempfile
 import subprocess
 import sys
 import time
@@ -24,12 +27,20 @@ from typing import Any
 import requests
 
 
-DEFAULT_BASE_URL = "https://newapi.l1uyun.one:8080"
+DEFAULT_BASE_URL = "https://newapi.l1uyun.top:8080"
 DEFAULT_ADMIN_TOKEN_CRED = "l1uyun-newapi-admin-access-token"
 DEFAULT_GENERAL_TOKEN_CRED = "l1uyun-newapi-general-api-key"
 DEFAULT_USER_ID = "1"
+DEFAULT_CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 DEFAULT_CODEX_CATALOG_PATH = Path.home() / ".codex" / "cc-switch-model-catalog.json"
 DEFAULT_CODEX_MODELS_CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
+DEFAULT_CODEXPLUSPLUS_SETTINGS_PATH = Path.home() / ".codex-session-delete" / "settings.json"
+DEFAULT_CC_SWITCH_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
+DEFAULT_PI_MODELS_PATH = Path.home() / ".pi" / "agent" / "models.json"
+DEFAULT_CODEBUDDY_MODELS_PATH = Path.home() / ".codebuddy" / "models.json"
+DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH = Path.home() / ".servitor" / "model_cache" / "pi_models.json"
+DEFAULT_CODEX_CATALOG_TASK_NAME = "CodexModelMenuCacheWatcher"
+DEFAULT_CODEX_CATALOG_LOG_PATH = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "RelayGate" / "codex-catalog-sync.json"
 SIGIL = Path(r"D:\AgentWork\tools\sigil\src\sigil.py")
 RESPONSES_BRIDGE_OPTION_KEY = "global.responses_to_chat_completions_policy"
 CHANNEL_STATUS_ENABLED = 1
@@ -60,6 +71,98 @@ CHANNEL_TYPES: dict[str, int] = {
 DEFAULT_MODELS = "gpt-5.5,gpt-5.4"
 
 
+
+def _reasoning_presets(efforts: list[str]) -> list[dict[str, str]]:
+    descriptions = {
+        "none": "Disable reasoning",
+        "low": "Fast responses with lighter reasoning",
+        "medium": "Balances speed and reasoning depth for everyday tasks",
+        "high": "Greater reasoning depth for complex problems",
+        "xhigh": "Extra high reasoning depth for complex problems",
+        "max": "Maximum reasoning depth for the hardest problems",
+        "ultra": "Maximum reasoning with automatic task delegation",
+    }
+    return [{"effort": effort, "description": descriptions[effort]} for effort in efforts]
+
+
+CODEX_MODEL_OVERRIDES: dict[str, dict[str, Any]] = {
+    "gpt-5.6-sol": {
+        "display_name": "GPT-5.6-Sol",
+        "description": "Latest frontier agentic coding model.",
+        "default_reasoning_level": "low",
+        "supported_reasoning_levels": _reasoning_presets(["low", "medium", "high", "xhigh", "max", "ultra"]),
+        "input_modalities": ["text", "image"],
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "tool_mode": "code_mode_only",
+        "multi_agent_version": "v2",
+        "use_responses_lite": True,
+    },
+    "gpt-5.6-terra": {
+        "display_name": "GPT-5.6-Terra",
+        "description": "Latest frontier agentic coding model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": _reasoning_presets(["low", "medium", "high", "xhigh", "max", "ultra"]),
+        "input_modalities": ["text", "image"],
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "tool_mode": "code_mode_only",
+        "multi_agent_version": "v2",
+        "use_responses_lite": True,
+    },
+    "gpt-5.6-luna": {
+        "display_name": "GPT-5.6-Luna",
+        "description": "Latest frontier agentic coding model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": _reasoning_presets(["low", "medium", "high", "xhigh", "max"]),
+        "input_modalities": ["text", "image"],
+        "supports_parallel_tool_calls": True,
+        "shell_type": "shell_command",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "tool_mode": "code_mode_only",
+        "multi_agent_version": "v1",
+        "use_responses_lite": True,
+    },
+    "grok-4.5": {
+        "display_name": "Grok 4.5",
+        "description": "xAI coding and agentic workflow model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": _reasoning_presets(["low", "medium", "high"]),
+    },
+    "grok-4.3": {
+        "display_name": "Grok 4.3",
+        "description": "xAI Responses API model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": _reasoning_presets(["none", "low", "medium", "high"]),
+    },
+    "grok-3-mini": {
+        "display_name": "Grok 3 Mini",
+        "description": "Compatibility alias currently resolved by xAI to Grok 4.3.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": _reasoning_presets(["none", "low", "medium", "high"]),
+    },
+    "grok-3-mini-fast": {
+        "display_name": "Grok 3 Mini Fast",
+        "description": "Fast compatibility alias currently resolved by xAI to Grok 4.3.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": _reasoning_presets(["none", "low", "medium", "high"]),
+    },
+    "workbuddy-glm-5.2": {
+        "display_name": "WorkBuddy GLM-5.2",
+        "description": "WorkBuddy relay alias for GLM-5.2.",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": _reasoning_presets(["none", "high"]),
+    },
+}
+
+CODEX_MODEL_QUARANTINE: dict[str, str] = {
+    "gpt-5.6-luna": "CPA advertises the id but has no eligible Codex auth; live Responses probe returned auth_unavailable on 2026-07-10.",
+}
 class CliError(RuntimeError):
     pass
 
@@ -104,6 +207,7 @@ class ContextMeta:
         "gpt-5.4-mini": "openai/gpt-5.4-mini",
         "gpt-5.5": "openai/gpt-5.5",
         "grok-4.3": "x-ai/grok-4.3",
+        "workbuddy-glm-5.2": "z-ai/glm-5.2",
         "kimi-for-coding": "moonshotai/kimi-k2.6",
         "step-3.7-flash": "stepfun/step-3.7-flash",
     }
@@ -114,6 +218,14 @@ class ContextMeta:
         "glm-5.2": 500_000,
         "gpt-5.5": 256_000,
         "gpt-5.5-openai-compact": 256_000,
+        "gpt-5.6-sol": 372_000,
+        "gpt-5.6-terra": 372_000,
+        "gpt-5.6-luna": 372_000,
+        "grok-4.5": 500_000,
+        "grok-4.3": 1_000_000,
+        "grok-3-mini": 1_000_000,
+        "grok-3-mini-fast": 1_000_000,
+        "workbuddy-glm-5.2": 500_000,
     }
 
     # Codex Desktop uses context_window as an ASYNC compaction trigger, not a hard
@@ -122,6 +234,7 @@ class ContextMeta:
     # upstream hard limit rejects the request (karma #147).
     CODEX_PRODUCT_OVERRIDES: dict[str, int] = {
         "glm-5.2": 400_000,
+        "workbuddy-glm-5.2": 400_000,
     }
 
     MAX_OUT_FALLBACK = {
@@ -279,7 +392,9 @@ def emit(data: Any, as_json: bool) -> None:
 def emit_and_optionally_log(data: Any, as_json: bool, json_log: str = "") -> None:
     text = json.dumps(data, ensure_ascii=False, indent=2)
     if json_log:
-        Path(json_log).write_text(text + "\n", encoding="utf-8")
+        log_path = Path(json_log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(text + "\n", encoding="utf-8")
     if as_json:
         print(text)
         return
@@ -323,6 +438,29 @@ def api_request(
     if data.get("success") is False:
         raise CliError(f"NewAPI error from {path}: {data.get('message')}")
     return data
+
+
+def channel_patch(
+    args: argparse.Namespace,
+    channel_id: int,
+    fields: dict[str, Any],
+    *,
+    status: int | None = None,
+) -> dict[str, Any]:
+    """Update a channel via PUT /api/channel/ using PATCH semantics.
+
+    NewAPI UpdateChannel rejects PUT bodies containing the status key
+    with 'Invalid parameters'. Status is an operational field managed
+    via POST /api/channel/:id/status. This helper sends only id +
+    changed fields, then optionally updates status via the dedicated
+    endpoint.
+    """
+    payload: dict[str, Any] = {"id": channel_id}
+    payload.update({k: v for k, v in fields.items() if v is not None})
+    response = api_request(args, "PUT", "/api/channel/", json_body=payload)
+    if status is not None:
+        api_request(args, "POST", f"/api/channel/{channel_id}/status", json_body={"status": status})
+    return response
 
 
 def caller_api_request(
@@ -852,7 +990,7 @@ def command_channels_create(args: argparse.Namespace) -> int:
 def command_channels_update(args: argparse.Namespace) -> int:
     data = api_request(args, "GET", f"/api/channel/{args.id}")
     before = data.get("data") or {}
-    after = dict(before)
+    after: dict[str, Any] = {"id": args.id}
     fields: list[str] = []
     simple_updates = {
         "name": args.name,
@@ -861,13 +999,15 @@ def command_channels_update(args: argparse.Namespace) -> int:
         "tag": args.tag,
         "priority": args.priority,
         "weight": args.weight,
-        "status": args.status,
         "test_model": args.test_model,
         "model_mapping": args.model_mapping,
         "status_code_mapping": args.status_code_mapping,
         "remark": args.remark,
         "auto_ban": args.auto_ban,
         "other": args.other,
+        "param_override": args.param_override,
+        "header_override": args.header_override,
+        "setting": args.setting,
     }
     for field, value in simple_updates.items():
         if value is None:
@@ -884,7 +1024,10 @@ def command_channels_update(args: argparse.Namespace) -> int:
     if key:
         after["key"] = key
         fields.append("key")
-    changes = change_summary(before, after, fields)
+    status = args.status
+    if status is not None:
+        fields.append("status")
+    changes = change_summary(before, {**before, **after}, fields)
     result: dict[str, Any] = {
         "dry_run": not effective_apply(args),
         "id": args.id,
@@ -892,7 +1035,8 @@ def command_channels_update(args: argparse.Namespace) -> int:
         "changes": changes,
     }
     if effective_apply(args):
-        result["api"] = redacted_tree(api_request(args, "PUT", "/api/channel/", json_body=after))
+        fields_for_put = {k: v for k, v in after.items() if k != "status"}
+        result["api"] = redacted_tree(channel_patch(args, args.id, fields_for_put, status=status))
         result["after"] = redacted_channel(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
     emit(result, args.json)
     return 0
@@ -1067,7 +1211,8 @@ def set_channel_quota_hold(
         "applied": False,
     }
     if apply and (changes or not already_held):
-        response = api_request(args, "PUT", "/api/channel/", json_body=after)
+        cid = int(channel.get("id") or 0)
+        response = channel_patch(args, cid, {"other_info": after["other_info"]}, status=CHANNEL_STATUS_MANUAL_DISABLED)
         result["applied"] = bool(response.get("success"))
         result["message"] = response.get("message") or ""
     return result
@@ -1299,7 +1444,7 @@ def recover_channels(args: argparse.Namespace) -> dict[str, Any]:
             "applied": False,
         }
         if effective_apply(args):
-            response = api_request(args, "PUT", "/api/channel/", json_body=full)
+            response = channel_patch(args, channel_id, {"other_info": full["other_info"]}, status=CHANNEL_STATUS_ENABLED)
             item["applied"] = bool(response.get("success"))
             item["message"] = response.get("message") or ""
         results.append(item)
@@ -1397,7 +1542,7 @@ def command_channel_models_set(args: argparse.Namespace) -> int:
         "changes": changes,
     }
     if effective_apply(args):
-        result["api"] = redacted_tree(api_request(args, "PUT", "/api/channel/", json_body=after))
+        result["api"] = redacted_tree(channel_patch(args, args.id, after))
         result["after"] = channel_model_summary(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
     emit(result, args.json)
     return 0
@@ -2305,7 +2450,7 @@ def run_channel_optimization(args: argparse.Namespace) -> dict[str, Any]:
         for channel_id, proposal in apply_proposals.items():
             full = api_request(args, "GET", f"/api/channel/{channel_id}").get("data") or {}
             full.update(proposal)
-            updated = api_request(args, "PUT", "/api/channel/", json_body=full)
+            updated = channel_patch(args, channel_id, {k: full[k] for k in proposal})
             apply_results.append(
                 {
                     "id": channel_id,
@@ -2513,8 +2658,7 @@ def stabilize_channel_weights(args: argparse.Namespace) -> list[dict[str, Any]]:
         if reason not in {"unchanged"} and target_weight != current_weight:
             if effective_apply(args):
                 full = api_request(args, "GET", f"/api/channel/{channel_id}").get("data") or {}
-                full["weight"] = target_weight
-                response = api_request(args, "PUT", "/api/channel/", json_body=full)
+                response = channel_patch(args, channel_id, {"weight": target_weight})
                 change["applied"] = bool(response.get("success"))
                 change["message"] = response.get("message") or ""
         audits.append(change)
@@ -2635,13 +2779,104 @@ def catalog_template_from_existing(existing: dict[str, Any]) -> dict[str, Any]:
     raise CliError("Codex catalog template has no usable model entries")
 
 
+
+def apply_codex_model_override(model: str, entry: dict[str, Any]) -> dict[str, Any]:
+    override = CODEX_MODEL_OVERRIDES.get(model)
+    if not override:
+        return entry
+    for key, value in override.items():
+        if key == "context_window":
+            entry["context_window"] = value
+            entry["max_context_window"] = value
+            entry["contextWindow"] = value
+            entry["effective_context_window_percent"] = 95
+        else:
+            entry[key] = value
+    return entry
+
+
+def _set_top_level_toml_string(config_text: str, key: str, value: str) -> str:
+    desired = f'{key} = {json.dumps(value)}'
+    lines = config_text.splitlines()
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            break
+        if key_re.match(line):
+            lines[index] = desired
+            return "\n".join(lines).rstrip() + "\n"
+    insert_at = next((index for index, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+    prefix = lines[:insert_at]
+    suffix = lines[insert_at:]
+    while prefix and not prefix[-1].strip():
+        prefix.pop()
+    if prefix:
+        prefix.extend(["", desired, ""])
+    else:
+        prefix.extend([desired, ""])
+    return "\n".join(prefix + suffix).rstrip() + "\n"
+
+
+
+def selectable_codex_model_ids(model_ids: list[str]) -> list[str]:
+    return [model for model in model_ids if model not in CODEX_MODEL_QUARANTINE]
+
+
+def agent_visible_model_ids(catalog: dict[str, Any]) -> list[str]:
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [
+        slug
+        for item in models
+        if isinstance(item, dict)
+        and (slug := _model_slug(item))
+        and str(item.get("visibility") or "list") != "hide"
+    ]
+
+
+def project_codexplusplus_settings(settings: dict[str, Any], model_ids: list[str]) -> dict[str, Any]:
+    profiles = settings.get("relayProfiles")
+    if not isinstance(profiles, list) or not profiles:
+        return {"profile_id": "", "repairs": [], "reason": "no-relay-profiles"}
+    active_id = str(settings.get("activeRelayId") or "")
+    profile = next((item for item in profiles if isinstance(item, dict) and str(item.get("id") or "") == active_id), None)
+    if profile is None:
+        profile = next((item for item in profiles if isinstance(item, dict)), None)
+    if profile is None:
+        return {"profile_id": "", "repairs": [], "reason": "no-relay-profiles"}
+
+    repairs: list[str] = []
+    desired_model_list = "\n".join(model_ids)
+    if str(profile.get("modelList") or "").strip() != desired_model_list:
+        profile["modelList"] = desired_model_list
+        repairs.append("modelList")
+
+    current_config = str(profile.get("configContents") or "")
+    desired_config = _set_top_level_toml_string(current_config, "model_catalog_json", DEFAULT_CODEX_CATALOG_PATH.name)
+    if desired_config != current_config:
+        profile["configContents"] = desired_config
+        repairs.append("configContents")
+
+    return {
+        "profile_id": str(profile.get("id") or ""),
+        "repairs": repairs,
+        "reason": "repaired" if repairs else "already-current",
+    }
+
+
+def build_codex_catalog_task_action(*, executable: Path, log_path: Path) -> str:
+    return (
+        f'"{executable}" --json codex-catalog sync --apply '
+        f'--log-path "{log_path}"'
+    )
 def build_codex_model_entry(model: str, template: dict[str, Any], priority: int) -> dict[str, Any]:
     entry = dict(template)
     entry["slug"] = model
     entry["display_name"] = display_name_for_model(model)
     entry["description"] = model_description(model)
     entry["priority"] = priority
-    entry["visibility"] = "hide" if model == "codex-auto-review" else "list"
+    entry["visibility"] = "hide" if model == "codex-auto-review" or model in CODEX_MODEL_QUARANTINE else "list"
     entry["availability_nux"] = None
     entry["upgrade"] = None
     entry["service_tiers"] = []
@@ -2667,14 +2902,15 @@ def build_codex_model_entry(model: str, template: dict[str, Any], priority: int)
     entry["context_window"] = ctx
     entry["max_context_window"] = ctx
     entry["effective_context_window_percent"] = 95
-    return entry
+    return apply_codex_model_override(model, entry)
 
 
 def codex_client_version_triplet() -> str:
     version_text = "0.140.0"
     try:
+        executable = os.environ.get("CODEX_CLI_PATH") or shutil.which("codex") or "codex"
         proc = subprocess.run(
-            [str(Path(os.environ.get("CODEX_CLI_PATH") or "")) or "codex", "--version"],
+            [executable, "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2725,15 +2961,292 @@ def live_newapi_model_ids(args: argparse.Namespace) -> list[str]:
     )
 
 
+def command_codex_catalog_models(args: argparse.Namespace) -> int:
+    model_ids = live_newapi_model_ids(args)
+    emit({"source": getattr(args, "source", "v1-models"), "count": len(model_ids), "models": model_ids}, args.json)
+    return 0
+
+
+
+def _model_slug(model: dict[str, Any]) -> str:
+    for key in ("slug", "model", "id", "name"):
+        value = str(model.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def read_cc_switch_model_specs(db_path: Path) -> dict[str, dict[str, Any]]:
+    if not db_path.is_file():
+        return {}
+    try:
+        connection = sqlite3.connect(db_path)
+        try:
+            row = connection.execute(
+                "select settings_config from providers where app_type='codex' and is_current=1 limit 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row or not str(row[0] or "").strip():
+            return {}
+        settings = json.loads(row[0])
+        models = ((settings.get("modelCatalog") or {}).get("models") or [])
+        return {
+            slug: dict(item)
+            for item in models
+            if isinstance(item, dict) and (slug := _model_slug(item))
+        }
+    except (sqlite3.Error, ValueError, TypeError):
+        return {}
+
+
+def _apply_cc_switch_spec(entry: dict[str, Any], spec: dict[str, Any] | None) -> dict[str, Any]:
+    if not spec:
+        return entry
+    display_name = str(spec.get("displayName") or spec.get("display_name") or "").strip()
+    if display_name:
+        entry["display_name"] = display_name
+        entry["displayName"] = display_name
+    context = spec.get("contextWindow") or spec.get("context_window") or spec.get("max_context_window")
+    if context is not None:
+        entry["context_window"] = int(context)
+        entry["max_context_window"] = int(context)
+        entry["contextWindow"] = int(context)
+    parallel = spec.get("supportsParallelToolCalls")
+    if isinstance(parallel, bool):
+        entry["supports_parallel_tool_calls"] = parallel
+    modalities = spec.get("inputModalities")
+    if isinstance(modalities, list) and modalities:
+        entry["input_modalities"] = modalities
+    base_instructions = str(spec.get("baseInstructions") or spec.get("base_instructions") or "").strip()
+    if base_instructions:
+        entry["base_instructions"] = base_instructions
+    return entry
+
+
+def build_projected_codex_catalog(
+    existing: dict[str, Any],
+    models_cache: dict[str, Any],
+    model_ids: list[str],
+    cc_switch_specs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    existing_models = [
+        item for payload in (existing, models_cache)
+        for item in (payload.get("models") if isinstance(payload, dict) else []) or []
+        if isinstance(item, dict)
+    ]
+    existing_by_slug = {_model_slug(item): item for item in existing_models if _model_slug(item)}
+    base_template = catalog_template_from_existing(existing)
+    projected: list[dict[str, Any]] = []
+    for index, model in enumerate(model_ids):
+        template = existing_by_slug.get(model)
+        if template is None and model == "workbuddy-glm-5.2":
+            template = existing_by_slug.get("glm-5.2")
+        if template is None:
+            template = base_template
+        seeded = _apply_cc_switch_spec(dict(template), cc_switch_specs.get(model))
+        entry = build_codex_model_entry(model, seeded, index * 2)
+        entry["model"] = model
+        entry["displayName"] = entry["display_name"]
+        entry["contextWindow"] = entry["context_window"]
+        for field in ("base_instructions", "supported_reasoning_levels", "truncation_policy"):
+            if field not in entry or entry[field] in (None, ""):
+                raise CliError(f"projected Codex model {model!r} is missing required field {field!r}")
+        projected.append(entry)
+    return {"models": projected}
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def sync_config_catalog_entry(config_path: Path, apply: bool) -> dict[str, Any]:
+    if not config_path.is_file():
+        return {"missing": True, "written": False, "needs_repair": False, "path": str(config_path)}
+    current = config_path.read_text(encoding="utf-8-sig")
+    desired = _set_top_level_toml_string(current, "model_catalog_json", DEFAULT_CODEX_CATALOG_PATH.name)
+    needs_repair = desired != current
+    if needs_repair and apply:
+        write_text_atomic(config_path, desired)
+    return {
+        "missing": False,
+        "written": bool(needs_repair and apply),
+        "needs_repair": needs_repair,
+        "path": str(config_path),
+    }
+
+
+def sync_cc_switch_provider_config(db_path: Path, apply: bool) -> dict[str, Any]:
+    if not db_path.is_file():
+        return {"missing": True, "written": False, "needs_repair": False, "path": str(db_path)}
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            "select rowid, settings_config from providers where app_type='codex' and is_current=1 limit 1"
+        ).fetchone()
+        if not row:
+            return {"missing": False, "written": False, "needs_repair": False, "reason": "no-current-provider", "path": str(db_path)}
+        rowid, raw = row
+        settings = json.loads(raw)
+        current = settings.get("config")
+        if not isinstance(current, str):
+            return {"missing": False, "written": False, "needs_repair": False, "reason": "no-config-source", "path": str(db_path)}
+        desired = _set_top_level_toml_string(current, "model_catalog_json", DEFAULT_CODEX_CATALOG_PATH.name)
+        needs_repair = desired != current
+        if needs_repair and apply:
+            settings["config"] = desired
+            connection.execute(
+                "update providers set settings_config=? where rowid=?",
+                (json.dumps(settings, ensure_ascii=False, separators=(",", ":")), rowid),
+            )
+            connection.commit()
+        return {
+            "missing": False,
+            "written": bool(needs_repair and apply),
+            "needs_repair": needs_repair,
+            "reason": "repaired" if needs_repair else "already-current",
+            "path": str(db_path),
+        }
+    finally:
+        connection.close()
+def sync_codexplusplus_settings_file(settings_path: Path, model_ids: list[str], apply: bool) -> dict[str, Any]:
+    if not settings_path.is_file():
+        return {"missing": True, "written": False, "repairs": [], "path": str(settings_path)}
+    settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+    projection = project_codexplusplus_settings(settings, model_ids)
+    written = bool(projection["repairs"] and apply)
+    if written:
+        write_json_atomic(settings_path, settings)
+    return {
+        "missing": False,
+        "written": written,
+        "needs_repair": bool(projection["repairs"]),
+        "path": str(settings_path),
+        **projection,
+    }
+
+
+def _resolve_relay_gate_executable(explicit: str = "") -> Path:
+    candidate = explicit or shutil.which("relay-gate") or sys.argv[0]
+    return Path(candidate).expanduser().resolve()
+
+
+def build_codex_catalog_task_create_command(
+    *,
+    executable: Path,
+    task_name: str,
+    interval_minutes: int,
+    log_path: Path,
+) -> list[str]:
+    action = build_codex_catalog_task_action(executable=executable, log_path=log_path)
+    return [
+        "schtasks.exe",
+        "/Create",
+        "/TN",
+        task_name,
+        "/SC",
+        "MINUTE",
+        "/MO",
+        str(interval_minutes),
+        "/TR",
+        action,
+        "/F",
+    ]
+
+
+def command_codex_catalog_task(args: argparse.Namespace) -> int:
+    task_name = args.task_name
+    executable = _resolve_relay_gate_executable(getattr(args, "executable", ""))
+    log_path = Path(getattr(args, "log_path", DEFAULT_CODEX_CATALOG_LOG_PATH)).expanduser()
+    action = args.task_action
+    if action == "install":
+        command = build_codex_catalog_task_create_command(
+            executable=executable,
+            task_name=task_name,
+            interval_minutes=args.interval_minutes,
+            log_path=log_path,
+        )
+    elif action == "status":
+        command = ["schtasks.exe", "/Query", "/TN", task_name, "/FO", "LIST", "/V"]
+    elif action == "remove":
+        command = ["schtasks.exe", "/Delete", "/TN", task_name, "/F"]
+    else:
+        raise CliError(f"unsupported task action: {action}")
+
+    apply = action == "status" or effective_apply(args)
+    result: dict[str, Any] = {
+        "action": action,
+        "task_name": task_name,
+        "dry_run": not apply,
+        "task_action": build_codex_catalog_task_action(executable=executable, log_path=log_path),
+        "command": command,
+    }
+    if apply:
+        if action == "install":
+            end_proc = subprocess.run(
+                ["schtasks.exe", "/End", "/TN", task_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            result["end_existing_returncode"] = end_proc.returncode
+        proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        result["returncode"] = proc.returncode
+        result["stdout"] = proc.stdout.strip()
+        result["stderr"] = proc.stderr.strip()
+        if proc.returncode != 0:
+            emit(result, args.json)
+            return proc.returncode
+    emit(result, args.json)
+    return 0
+
+
 def command_codex_catalog_sync(args: argparse.Namespace) -> int:
+    config_path = Path(getattr(args, "config_path", DEFAULT_CODEX_CONFIG_PATH)).expanduser()
     catalog_path = Path(args.catalog_path).expanduser()
     if not catalog_path.is_absolute():
         catalog_path = Path.home() / ".codex" / catalog_path
     models_cache_path = Path(args.models_cache_path).expanduser()
     if not models_cache_path.is_absolute():
         models_cache_path = Path.home() / ".codex" / models_cache_path
-    existing = json.loads(catalog_path.read_text(encoding="utf-8"))
-    template = catalog_template_from_existing(existing)
+    plus_settings_path = Path(args.codex_plus_plus_settings_path).expanduser()
+    cc_switch_db_path = Path(args.cc_switch_db_path).expanduser()
+
+    existing = json.loads(catalog_path.read_text(encoding="utf-8-sig"))
+    if models_cache_path.is_file():
+        existing_cache = json.loads(models_cache_path.read_text(encoding="utf-8-sig"))
+    else:
+        existing_cache = {"models": []}
     if args.source == "channels":
         model_ids = configured_channel_model_ids(args)
     else:
@@ -2743,17 +3256,14 @@ def command_codex_catalog_sync(args: argparse.Namespace) -> int:
     pinned = split_list(args.pin_first)
     ordered = [model for model in pinned if model in model_ids]
     ordered.extend(model for model in model_ids if model not in set(ordered))
-    new_catalog = {
-        "models": [
-            build_codex_model_entry(model, template, index * 2)
-            for index, model in enumerate(ordered)
-        ]
-    }
-    new_models_cache = build_codex_models_cache(new_catalog)
+
+    cc_switch_specs = read_cc_switch_model_specs(cc_switch_db_path)
+    new_catalog = build_projected_codex_catalog(existing, existing_cache, ordered, cc_switch_specs)
     before = [item.get("slug") for item in existing.get("models", []) if isinstance(item, dict)]
     after = [item.get("slug") for item in new_catalog["models"]]
-    result = {
-        "dry_run": not effective_apply(args),
+    apply = effective_apply(args)
+    result: dict[str, Any] = {
+        "dry_run": not apply,
         "catalog_path": str(catalog_path),
         "models_cache_path": str(models_cache_path),
         "source": args.source,
@@ -2762,98 +3272,263 @@ def command_codex_catalog_sync(args: argparse.Namespace) -> int:
         "added": sorted(set(after) - set(before)),
         "removed": sorted(set(before) - set(after)),
         "models": after,
+        "cc_switch_specs": sorted(set(after) & set(cc_switch_specs)),
+        "synthesized_models": sorted(set(after) - set(cc_switch_specs)),
     }
-    if effective_apply(args):
-        catalog_path.write_text(json.dumps(new_catalog, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        models_cache_path.write_text(
-            json.dumps(new_models_cache, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+    catalog_changed = existing != new_catalog
+    expected_client_version = codex_client_version_triplet()
+    cache_shape_ok = all(key in existing_cache for key in ("fetched_at", "client_version", "models"))
+    cache_models_equal = existing_cache.get("models") == new_catalog["models"]
+    cache_version_equal = existing_cache.get("client_version") == expected_client_version
+    cache_changed = not (cache_shape_ok and cache_models_equal and cache_version_equal)
+    new_models_cache = build_codex_models_cache(new_catalog) if cache_changed else existing_cache
+    if cache_changed:
+        new_models_cache["client_version"] = expected_client_version
+    written_files: list[str] = []
+    if apply:
+        if catalog_changed:
+            write_json_atomic(catalog_path, new_catalog)
+            written_files.append(str(catalog_path))
+        if cache_changed:
+            write_json_atomic(models_cache_path, new_models_cache)
+            written_files.append(str(models_cache_path))
+        result["written"] = bool(written_files)
+        result["written_files"] = written_files
+
+    selectable_models = selectable_codex_model_ids(after)
+    result["quarantined_models"] = sorted(set(after) & set(CODEX_MODEL_QUARANTINE))
+    result["selectable_models"] = selectable_models
+
+    if getattr(args, "sync_config", True):
+        result["config"] = sync_config_catalog_entry(config_path, apply)
+        result["cc_switch_config"] = sync_cc_switch_provider_config(cc_switch_db_path, apply)
+    else:
+        result["config"] = {"skipped": True, "written": False}
+        result["cc_switch_config"] = {"skipped": True, "written": False}
+
+    if args.sync_codex_plus_plus:
+        result["codex_plus_plus"] = sync_codexplusplus_settings_file(plus_settings_path, selectable_models, apply)
+    else:
+        result["codex_plus_plus"] = {"skipped": True, "written": False}
+
+    if getattr(args, "sync_agent_models", False):
+        result["agent_models"] = sync_agent_model_files(
+            agent_visible_model_ids(new_catalog),
+            pi_path=Path(getattr(args, "pi_models_path", DEFAULT_PI_MODELS_PATH)).expanduser(),
+            pi_cache_path=Path(getattr(args, "pi_models_cache_path", DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH)).expanduser(),
+            codebuddy_path=Path(getattr(args, "codebuddy_models_path", DEFAULT_CODEBUDDY_MODELS_PATH)).expanduser(),
+            agent="all",
+            apply=apply,
         )
-        result["written"] = True
-    emit(result, args.json)
+    else:
+        result["agent_models"] = {"skipped": True, "agents": {}}
+
+    emit_and_optionally_log(result, args.json, getattr(args, "log_path", "") or "")
     return 0
 
 
-def _sync_pi_models(pi_path: Path, apply: bool) -> dict[str, Any]:
-    """Write contextWindow/maxTokens into ~/.pi/agent/models.json."""
+def _model_supports_reasoning(model_id: str) -> bool:
+    override = CODEX_MODEL_OVERRIDES.get(model_id) or {}
+    levels = override.get("supported_reasoning_levels") or []
+    return any(str(item.get("effort") or "none") != "none" for item in levels if isinstance(item, dict))
+
+
+def _model_vendor(model_id: str) -> str:
+    lower = model_id.lower()
+    if lower.startswith("gpt-"):
+        return "OpenAI"
+    if lower.startswith("grok-"):
+        return "xAI"
+    if lower.startswith("deepseek-"):
+        return "DeepSeek"
+    if lower.startswith(("glm-", "workbuddy-glm-")):
+        return "Zhipu"
+    if lower.startswith("kimi-"):
+        return "Moonshot"
+    if lower.startswith("step-"):
+        return "StepFun"
+    return "Unknown"
+
+
+def _sync_pi_models(
+    pi_path: Path,
+    model_ids: list[str],
+    apply: bool,
+    *,
+    cache_path: Path | None = None,
+) -> dict[str, Any]:
+    """Reconcile Pi's NewAPI provider and refresh context metadata."""
     config = json.loads(pi_path.read_text(encoding="utf-8"))
-    rows = []
-    changed = 0
-    for prov_name, prov in config.get("providers", {}).items():
-        if not isinstance(prov, dict) or not isinstance(prov.get("models"), list):
-            continue
-        for m in prov["models"]:
-            if not isinstance(m, dict) or not m.get("id"):
-                continue
-            pi_id = m["id"]
-            ctx, max_out = ContextMeta.resolve(pi_id, for_codex=False)
-            old_ctx = m.get("contextWindow")
-            old_max = m.get("maxTokens")
-            if ctx and ctx != old_ctx:
-                m["contextWindow"] = ctx
-            if max_out and max_out != old_max:
-                m["maxTokens"] = max_out
-            if m.get("contextWindow") != old_ctx or m.get("maxTokens") != old_max:
-                changed += 1
-            rows.append({
-                "provider": prov_name,
-                "model": pi_id,
-                "contextWindow": m.get("contextWindow"),
-                "maxTokens": m.get("maxTokens"),
-                "changed": (m.get("contextWindow") != old_ctx or m.get("maxTokens") != old_max),
-            })
-    if apply:
-        pi_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return {"path": str(pi_path), "total": len(rows), "changed": changed, "models": rows, "written": apply}
+    providers = config.get("providers") if isinstance(config, dict) else None
+    provider = providers.get("newapi") if isinstance(providers, dict) else None
+    if not isinstance(provider, dict) or not isinstance(provider.get("models"), list):
+        return {"path": str(pi_path), "error": "newapi provider models list not found", "written": False}
+
+    original_models = [item for item in provider["models"] if isinstance(item, dict) and item.get("id")]
+    existing_by_id = {str(item["id"]): item for item in original_models}
+    before_ids = list(existing_by_id)
+    desired_models: list[dict[str, Any]] = []
+    metadata_changed = 0
+    for model_id in model_ids:
+        entry = dict(existing_by_id.get(model_id) or {"id": model_id})
+        if model_id not in existing_by_id:
+            entry["reasoning"] = _model_supports_reasoning(model_id)
+        old_ctx = entry.get("contextWindow")
+        old_max = entry.get("maxTokens")
+        ctx, max_out = ContextMeta.resolve(model_id, for_codex=False)
+        if ctx is not None:
+            entry["contextWindow"] = ctx
+        if max_out is not None:
+            entry["maxTokens"] = max_out
+        if entry.get("contextWindow") != old_ctx or entry.get("maxTokens") != old_max:
+            metadata_changed += 1
+        desired_models.append(entry)
+
+    provider["models"] = desired_models
+    changed = original_models != desired_models
+    if changed and apply:
+        write_json_atomic(pi_path, config)
+    cache_changed = False
+    cache_written = False
+    if cache_path is not None:
+        cache_models = [
+            f"{provider_name}/{item['id']}"
+            for provider_name, provider_config in providers.items()
+            if isinstance(provider_config, dict) and isinstance(provider_config.get("models"), list)
+            for item in provider_config["models"]
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+        try:
+            existing_cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.is_file() else []
+        except (OSError, ValueError, TypeError):
+            existing_cache = []
+        cache_changed = existing_cache != cache_models
+        if cache_changed and apply:
+            write_json_atomic(cache_path, cache_models)
+            cache_written = True
+    return {
+        "path": str(pi_path),
+        "total": len(desired_models),
+        "added": [model for model in model_ids if model not in existing_by_id],
+        "removed": [model for model in before_ids if model not in set(model_ids)],
+        "metadata_changed": metadata_changed,
+        "written": bool(changed and apply),
+        "needs_repair": changed,
+        "cache_path": str(cache_path) if cache_path is not None else "",
+        "cache_written": cache_written,
+        "cache_needs_repair": cache_changed,
+    }
 
 
-def _sync_codebuddy_models(cb_path: Path, apply: bool) -> dict[str, Any]:
-    """Write maxInputTokens/maxOutputTokens into ~/.codebuddy/models.json."""
+def _sync_codebuddy_models(cb_path: Path, model_ids: list[str], apply: bool) -> dict[str, Any]:
+    """Reconcile CodeBuddy custom models and refresh context metadata."""
     config = json.loads(cb_path.read_text(encoding="utf-8"))
     models = config.get("models") if isinstance(config, dict) else config
     if not isinstance(models, list):
-        return {"path": str(cb_path), "error": "no models list found"}
-    rows = []
-    changed = 0
-    for m in models:
-        if not isinstance(m, dict) or not m.get("id"):
-            continue
-        cb_id = m["id"]
-        ctx, max_out = ContextMeta.resolve(cb_id, for_codex=False)
-        old_ctx = m.get("maxInputTokens")
-        old_max = m.get("maxOutputTokens")
-        if ctx and ctx != old_ctx:
-            m["maxInputTokens"] = ctx
-        if max_out and max_out != old_max:
-            m["maxOutputTokens"] = max_out
-        if m.get("maxInputTokens") != old_ctx or m.get("maxOutputTokens") != old_max:
-            changed += 1
-        rows.append({
-            "model": cb_id,
-            "maxInputTokens": m.get("maxInputTokens"),
-            "maxOutputTokens": m.get("maxOutputTokens"),
-            "changed": (m.get("maxInputTokens") != old_ctx or m.get("maxOutputTokens") != old_max),
-        })
-    if apply:
-        cb_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return {"path": str(cb_path), "total": len(rows), "changed": changed, "models": rows, "written": apply}
+        return {"path": str(cb_path), "error": "no models list found", "written": False}
+
+    original_models = [item for item in models if isinstance(item, dict) and item.get("id")]
+    original_available = list(config.get("availableModels") or []) if isinstance(config, dict) else []
+    existing_by_id = {str(item["id"]): item for item in original_models}
+    before_ids = list(existing_by_id)
+    desired_models: list[dict[str, Any]] = []
+    metadata_changed = 0
+    for model_id in model_ids:
+        vendor = _model_vendor(model_id)
+        template = next((item for item in original_models if str(item.get("vendor") or "") == vendor), None)
+        if template is None:
+            template = original_models[0] if original_models else None
+        if model_id in existing_by_id:
+            entry = dict(existing_by_id[model_id])
+        elif template is not None:
+            entry = dict(template)
+        else:
+            return {"path": str(cb_path), "error": "no existing model template with credentials", "written": False}
+        old_ctx = entry.get("maxInputTokens")
+        old_max = entry.get("maxOutputTokens")
+        entry["id"] = model_id
+        entry["name"] = display_name_for_model(model_id)
+        entry["vendor"] = vendor
+        entry.setdefault("supportsToolCall", True)
+        modalities = (CODEX_MODEL_OVERRIDES.get(model_id) or {}).get("input_modalities") or []
+        if modalities:
+            entry["supportsImages"] = "image" in modalities
+        if _model_supports_reasoning(model_id):
+            entry["supportsReasoning"] = True
+        elif model_id not in existing_by_id:
+            entry.pop("supportsReasoning", None)
+        ctx, max_out = ContextMeta.resolve(model_id, for_codex=False)
+        if ctx is not None:
+            entry["maxInputTokens"] = ctx
+        if max_out is not None:
+            entry["maxOutputTokens"] = max_out
+        if entry.get("maxInputTokens") != old_ctx or entry.get("maxOutputTokens") != old_max:
+            metadata_changed += 1
+        desired_models.append(entry)
+
+    if isinstance(config, dict):
+        config["models"] = desired_models
+        config["availableModels"] = list(model_ids)
+        desired_payload: Any = config
+    else:
+        desired_payload = desired_models
+    changed = original_models != desired_models or (isinstance(config, dict) and original_available != model_ids)
+    if changed and apply:
+        write_json_atomic(cb_path, desired_payload)
+    return {
+        "path": str(cb_path),
+        "total": len(desired_models),
+        "added": [model for model in model_ids if model not in existing_by_id],
+        "removed": [model for model in before_ids if model not in set(model_ids)],
+        "metadata_changed": metadata_changed,
+        "written": bool(changed and apply),
+        "needs_repair": changed,
+    }
+
+
+def sync_agent_model_files(
+    model_ids: list[str],
+    *,
+    pi_path: Path,
+    pi_cache_path: Path,
+    codebuddy_path: Path,
+    agent: str,
+    apply: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"model_count": len(model_ids), "models": model_ids, "agents": {}}
+    if agent in ("pi", "all"):
+        result["agents"]["pi"] = (
+            _sync_pi_models(pi_path, model_ids, apply, cache_path=pi_cache_path)
+            if pi_path.is_file()
+            else {"path": str(pi_path), "error": "not found", "written": False}
+        )
+    if agent in ("codebuddy", "all"):
+        result["agents"]["codebuddy"] = (
+            _sync_codebuddy_models(codebuddy_path, model_ids, apply)
+            if codebuddy_path.is_file()
+            else {"path": str(codebuddy_path), "error": "not found", "written": False}
+        )
+    return result
 
 
 def command_agent_models_sync(args: argparse.Namespace) -> int:
     apply = effective_apply(args)
-    result: dict[str, Any] = {"dry_run": not apply, "agents": {}}
-    if args.agent in ("pi", "all"):
-        pi_path = Path(args.pi_models_path).expanduser()
-        if pi_path.exists():
-            result["agents"]["pi"] = _sync_pi_models(pi_path, apply)
-        else:
-            result["agents"]["pi"] = {"error": f"not found: {pi_path}"}
-    if args.agent in ("codebuddy", "all"):
-        cb_path = Path(args.codebuddy_models_path).expanduser()
-        if cb_path.exists():
-            result["agents"]["codebuddy"] = _sync_codebuddy_models(cb_path, apply)
-        else:
-            result["agents"]["codebuddy"] = {"error": f"not found: {cb_path}"}
+    catalog_path = Path(args.catalog_path).expanduser()
+    if not catalog_path.is_file():
+        raise CliError(f"Codex model catalog not found: {catalog_path}")
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8-sig"))
+    result: dict[str, Any] = {
+        "dry_run": not apply,
+        "catalog_path": str(catalog_path),
+        **sync_agent_model_files(
+            agent_visible_model_ids(catalog),
+            pi_path=Path(args.pi_models_path).expanduser(),
+            pi_cache_path=Path(args.pi_models_cache_path).expanduser(),
+            codebuddy_path=Path(args.codebuddy_models_path).expanduser(),
+            agent=args.agent,
+            apply=apply,
+        ),
+    }
     emit(result, args.json)
     return 0
 
@@ -2924,8 +3599,8 @@ def add_optimizer_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--promote-probe-max-tokens", type=int, default=8, help="max_tokens for the recovery probe.")
     parser.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED, help="Sigil cred for the caller token used when --promote-on-recovery runs the SSE probe through the gateway.")
     parser.add_argument("--apply-multi-model-channel", action="store_true", help="Allow per-model recommendations to update channel-level priority/weight for channels exposing multiple models. Use only for the automated maintainer where channel-level tradeoffs are intentional.")
-    parser.add_argument("--dry-run", action="store_true", help="Preview only. Routing optimizer applies by default unless --dry-run is set.")
-    parser.add_argument("--apply", action="store_true", default=True, help="Actually update NewAPI channel priority/weight fields. This is the channel optimizer default.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    parser.add_argument("--apply", action="store_true", help="Actually update NewAPI channel priority/weight fields.")
 
 
 def add_bool_pair(parser: argparse.ArgumentParser, name: str, *, dest: str, default: bool | None, help_on: str, help_off: str) -> None:
@@ -2948,26 +3623,69 @@ def build_parser() -> argparse.ArgumentParser:
     catalog = sub.add_parser("codex-catalog", help="Sync Codex model catalog from NewAPI models.")
     catalog_sub = catalog.add_subparsers(dest="codex_catalog_command", required=True)
 
-    p = catalog_sub.add_parser("sync", help="Write Codex model_catalog_json from NewAPI's exposed models.")
+    p = catalog_sub.add_parser("models", help="List model ids exposed by NewAPI for Codex catalog filtering.")
+    p.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED)
+    p.add_argument("--source", choices=["v1-models"], default="v1-models")
+    p.set_defaults(func=command_codex_catalog_models)
+
+    p = catalog_sub.add_parser("sync", help="Project the live NewAPI model set into Codex, Codex++, Pi, and CodeBuddy local catalogs.")
+    p.add_argument("--config-path", default=str(DEFAULT_CODEX_CONFIG_PATH))
     p.add_argument("--catalog-path", default=str(DEFAULT_CODEX_CATALOG_PATH))
     p.add_argument("--models-cache-path", default=str(DEFAULT_CODEX_MODELS_CACHE_PATH))
+    p.add_argument("--codex-plus-plus-settings-path", default=str(DEFAULT_CODEXPLUSPLUS_SETTINGS_PATH))
+    p.add_argument("--cc-switch-db-path", default=str(DEFAULT_CC_SWITCH_DB_PATH))
     p.add_argument("--caller-token-cred", default=DEFAULT_GENERAL_TOKEN_CRED)
     p.add_argument("--source", choices=["v1-models", "channels"], default="v1-models")
     p.add_argument("--include-hidden", action="store_true", help="Include hidden operational models such as codex-auto-review.")
     p.add_argument("--include-disabled", action="store_true", help="When --source channels, include disabled channels.")
     p.add_argument("--exclude-tag", action="append", default=[], help="When --source channels, skip channels with this tag.")
     p.add_argument("--pin-first", default="gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex,gpt-5.2,glm-5.2")
+    p.add_argument("--sync-codex-plus-plus", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--sync-config", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--sync-agent-models", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--pi-models-path", default=str(DEFAULT_PI_MODELS_PATH))
+    p.add_argument("--pi-models-cache-path", default=str(DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH))
+    p.add_argument("--codebuddy-models-path", default=str(DEFAULT_CODEBUDDY_MODELS_PATH))
+    p.add_argument("--log-path", default="", help="Write the latest sync result JSON for scheduled runs.")
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=command_codex_catalog_sync)
 
-    agent_models = sub.add_parser("agent-models", help="Sync agent models.json (pi, codebuddy) context windows from OpenRouter + local overrides.")
+    task = catalog_sub.add_parser("task", help="Manage the Windows scheduled task that runs catalog sync through relay-gate.")
+    task_sub = task.add_subparsers(dest="task_action", required=True)
+
+    p = task_sub.add_parser("install", help="Create or replace the relay-gate Codex catalog sync task.")
+    p.add_argument("--task-name", default=DEFAULT_CODEX_CATALOG_TASK_NAME)
+    p.add_argument("--interval-minutes", type=int, default=5)
+    p.add_argument("--executable", default="", help="relay-gate executable path; defaults to the active CLI.")
+    p.add_argument("--log-path", default=str(DEFAULT_CODEX_CATALOG_LOG_PATH))
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_codex_catalog_task)
+
+    p = task_sub.add_parser("status", help="Query the relay-gate Codex catalog sync task.")
+    p.add_argument("--task-name", default=DEFAULT_CODEX_CATALOG_TASK_NAME)
+    p.add_argument("--executable", default="")
+    p.add_argument("--log-path", default=str(DEFAULT_CODEX_CATALOG_LOG_PATH))
+    p.set_defaults(func=command_codex_catalog_task, dry_run=False, apply=True)
+
+    p = task_sub.add_parser("remove", help="Delete the relay-gate Codex catalog sync task.")
+    p.add_argument("--task-name", default=DEFAULT_CODEX_CATALOG_TASK_NAME)
+    p.add_argument("--executable", default="")
+    p.add_argument("--log-path", default=str(DEFAULT_CODEX_CATALOG_LOG_PATH))
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=command_codex_catalog_task)
+
+    agent_models = sub.add_parser("agent-models", help="Sync Pi and CodeBuddy model lists from the normalized local NewAPI catalog.")
     agent_models_sub = agent_models.add_subparsers(dest="agent_models_command", required=True)
 
-    p = agent_models_sub.add_parser("sync", help="Write contextWindow/maxTokens into pi and codebuddy models.json from OpenRouter metadata.")
+    p = agent_models_sub.add_parser("sync", help="Reconcile model ids and context metadata in Pi and CodeBuddy configs.")
     p.add_argument("--agent", choices=["pi", "codebuddy", "all"], default="all", help="Which agent config to sync.")
-    p.add_argument("--pi-models-path", default=str(Path.home() / ".pi" / "agent" / "models.json"))
-    p.add_argument("--codebuddy-models-path", default=str(Path.home() / ".codebuddy" / "models.json"))
+    p.add_argument("--catalog-path", default=str(DEFAULT_CODEX_CATALOG_PATH))
+    p.add_argument("--pi-models-path", default=str(DEFAULT_PI_MODELS_PATH))
+    p.add_argument("--pi-models-cache-path", default=str(DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH))
+    p.add_argument("--codebuddy-models-path", default=str(DEFAULT_CODEBUDDY_MODELS_PATH))
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=command_agent_models_sync)
@@ -3025,6 +3743,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remark", default=None)
     p.add_argument("--auto-ban", type=int, default=None)
     p.add_argument("--other", default=None)
+    p.add_argument("--param-override", default=None, help="JSON string for param_override (replaces entire field).")
+    p.add_argument("--header-override", default=None, help="JSON string for header_override (replaces entire field).")
+    p.add_argument("--setting", default=None, help="JSON string for setting field (replaces entire field).")
     p.add_argument("--keep-v1", action="store_true", help="Do not strip a trailing /v1 from upstream base_url.")
     add_channel_secret_flags(p, required=False)
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
