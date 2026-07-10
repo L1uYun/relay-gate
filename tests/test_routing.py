@@ -71,7 +71,12 @@ class RoutingProposalTest(unittest.TestCase):
                 entry = mod.build_codex_model_entry(model, template, 0)
                 self.assertEqual(entry["default_reasoning_level"], "medium")
                 self.assertEqual(entry["default_reasoning_summary"], "auto")
-                self.assertEqual(entry["supported_reasoning_levels"], template["supported_reasoning_levels"])
+                self.assertEqual(
+                    [item["effort"] for item in entry["supported_reasoning_levels"]],
+                    ["low", "medium", "high", "xhigh"],
+                )
+                self.assertEqual(entry["supported_reasoning_levels"][0], template["supported_reasoning_levels"][0])
+                self.assertEqual(entry["supported_reasoning_levels"][-1], template["supported_reasoning_levels"][-1])
                 self.assertTrue(entry["supports_reasoning_summaries"])
 
     def test_non_buddy_responses_bridge_models_keep_reasoning_metadata(self):
@@ -89,8 +94,37 @@ class RoutingProposalTest(unittest.TestCase):
             with self.subTest(model=model):
                 entry = mod.build_codex_model_entry(model, template, 0)
                 self.assertEqual(entry["default_reasoning_level"], "medium")
-                self.assertEqual(entry["supported_reasoning_levels"], template["supported_reasoning_levels"])
+                self.assertEqual(
+                    [item["effort"] for item in entry["supported_reasoning_levels"]],
+                    ["low", "medium", "high", "xhigh"],
+                )
+                self.assertEqual(entry["supported_reasoning_levels"][0], template["supported_reasoning_levels"][0])
+                self.assertEqual(entry["supported_reasoning_levels"][-1], template["supported_reasoning_levels"][-1])
                 self.assertTrue(entry["supports_reasoning_summaries"])
+
+    def test_codex_catalog_entries_add_reasoning_floor_and_keep_extras(self):
+        mod = load_relay_gate()
+        template = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                {"effort": "none", "description": "Disable reasoning", "custom": "keep"},
+                {"effort": "high", "description": "Provider high"},
+                {"effort": "high", "description": "Duplicate high"},
+                {"effort": "ultra", "description": "Provider ultra"},
+            ],
+        }
+
+        entry = mod.build_codex_model_entry("deepseek-v4-pro", template, 0)
+
+        self.assertEqual(
+            [item["effort"] for item in entry["supported_reasoning_levels"]],
+            ["none", "low", "medium", "high", "xhigh", "ultra"],
+        )
+        self.assertEqual(entry["supported_reasoning_levels"][0]["custom"], "keep")
+        self.assertEqual(entry["supported_reasoning_levels"][3]["description"], "Provider high")
+        self.assertEqual(entry["default_reasoning_level"], "high")
 
     def test_codex_catalog_models_command_reads_only_v1_models(self):
         mod = load_relay_gate()
@@ -152,11 +186,11 @@ class RoutingProposalTest(unittest.TestCase):
             "gpt-5.6-sol": (372000, "low", ["low", "medium", "high", "xhigh", "max", "ultra"]),
             "gpt-5.6-terra": (372000, "medium", ["low", "medium", "high", "xhigh", "max", "ultra"]),
             "gpt-5.6-luna": (372000, "medium", ["low", "medium", "high", "xhigh", "max"]),
-            "grok-4.5": (500000, "medium", ["low", "medium", "high"]),
-            "grok-4.3": (1000000, "medium", ["none", "low", "medium", "high"]),
-            "grok-3-mini": (1000000, "medium", ["none", "low", "medium", "high"]),
-            "grok-3-mini-fast": (1000000, "medium", ["none", "low", "medium", "high"]),
-            "workbuddy-glm-5.2": (400000, "high", ["none", "high"]),
+            "grok-4.5": (500000, "medium", ["low", "medium", "high", "xhigh"]),
+            "grok-4.3": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
+            "grok-3-mini": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
+            "grok-3-mini-fast": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
+            "workbuddy-glm-5.2": (400000, "high", ["none", "low", "medium", "high", "xhigh"]),
         }
 
         for model, (context_window, default_effort, efforts) in expected.items():
@@ -194,15 +228,17 @@ class RoutingProposalTest(unittest.TestCase):
         self.assertEqual(result["profile_id"], "relay-gate")
         self.assertEqual(result["repairs"], ["modelList", "configContents"])
 
-    def test_codex_catalog_task_command_runs_relay_gate_directly(self):
+    def test_codex_catalog_task_command_uses_pythonw_without_console(self):
         mod = load_relay_gate()
 
         command = mod.build_codex_catalog_task_action(
-            executable=Path(r"D:\Python3.11.1\Scripts\relay-gate.exe"),
+            pythonw_executable=Path(r"D:\Python3.11.1\pythonw.exe"),
+            script_path=Path(r"D:\AgentWork\tools\relay-gate\scripts\relay_gate.py"),
             log_path=Path(r"C:\Users\84618\AppData\Local\RelayGate\codex-catalog-sync.json"),
         )
 
-        self.assertTrue(command.startswith('"D:\\Python3.11.1\\Scripts\\relay-gate.exe" --json codex-catalog sync --apply'))
+        self.assertTrue(command.startswith('"D:\\Python3.11.1\\pythonw.exe" "D:\\AgentWork\\tools\\relay-gate\\scripts\\relay_gate.py"'))
+        self.assertIn("--json codex-catalog sync --apply", command)
         self.assertIn('--log-path "C:\\Users\\84618\\AppData\\Local\\RelayGate\\codex-catalog-sync.json"', command)
         self.assertNotIn("powershell", command.lower())
         self.assertNotIn("wscript", command.lower())
@@ -232,12 +268,14 @@ class RoutingProposalTest(unittest.TestCase):
             pi_path = root / "pi-models.json"
             pi_cache_path = root / "pi-model-cache.json"
             codebuddy_path = root / "codebuddy-models.json"
+            workbuddy_path = root / "workbuddy-models.json"
             config_path.write_text('model = "gpt-5.5"\n[model_providers.custom]\nbase_url = "https://example.test/v1"\n', encoding="utf-8")
             catalog_path.write_text(json.dumps({"models": [template]}), encoding="utf-8")
             cache_path.write_text(json.dumps({"models": [template]}), encoding="utf-8")
             plus_path.write_text(json.dumps({"relayProfiles": [{"id": "relay", "modelList": "", "configContents": "model = \"gpt-5.5\"\n"}]}), encoding="utf-8")
             pi_path.write_text(json.dumps({"providers": {"newapi": {"models": [{"id": "gpt-5.5", "reasoning": True}], "apiKey": "pi-secret"}}}), encoding="utf-8")
             codebuddy_path.write_text(json.dumps({"models": [{"id": "gpt-5.5", "apiKey": "cb-secret", "url": "https://example.test/v1/chat/completions"}], "availableModels": ["gpt-5.5"]}), encoding="utf-8")
+            workbuddy_path.write_text(json.dumps([{"id": "gpt-5.5", "apiKey": "wb-secret", "url": "https://old.example/v1/chat/completions"}]), encoding="utf-8")
             db = sqlite3.connect(db_path)
             try:
                 db.execute("create table providers (app_type text, is_current integer, settings_config text)")
@@ -277,6 +315,8 @@ class RoutingProposalTest(unittest.TestCase):
                     pi_models_path=str(pi_path),
                     pi_models_cache_path=str(pi_cache_path),
                     codebuddy_models_path=str(codebuddy_path),
+                    workbuddy_models_path=str(workbuddy_path),
+                    base_url="https://example.test:8080",
                     log_path="",
                     dry_run=False,
                     apply=True,
@@ -308,7 +348,13 @@ class RoutingProposalTest(unittest.TestCase):
             self.assertTrue(emitted[0]["codex_plus_plus"]["written"])
             self.assertEqual([item["id"] for item in json.loads(pi_path.read_text(encoding="utf-8"))["providers"]["newapi"]["models"]], ["gpt-5.5", "gpt-5.6-sol"])
             self.assertEqual(json.loads(codebuddy_path.read_text(encoding="utf-8"))["availableModels"], ["gpt-5.5", "gpt-5.6-sol"])
+            workbuddy = json.loads(workbuddy_path.read_text(encoding="utf-8"))
+            self.assertEqual([item["id"] for item in workbuddy], ["gpt-5.5", "gpt-5.6-sol"])
+            self.assertEqual({item["url"] for item in workbuddy}, {"https://example.test:8080/v1/chat/completions"})
+            self.assertEqual({item["apiKey"] for item in workbuddy}, {"wb-secret"})
+            self.assertEqual(set(emitted[0]["agent_models"]["agents"]), {"pi", "codebuddy", "workbuddy"})
             self.assertTrue(emitted[0]["agent_models"]["agents"]["pi"]["written"])
+            self.assertTrue(emitted[0]["agent_models"]["agents"]["workbuddy"]["written"])
 
     def test_codex_catalog_task_parser_uses_cli_task_manager(self):
         mod = load_relay_gate()
@@ -359,6 +405,56 @@ class RoutingProposalTest(unittest.TestCase):
             path = Path(td) / "nested" / "sync.json"
             mod.emit_and_optionally_log({"ok": True}, False, str(path))
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"ok": True})
+
+    def test_main_writes_structured_failure_log_for_cli_error(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "sync.json"
+
+            def fail(_args):
+                raise mod.CliError("blocked")
+
+            class Parser:
+                def parse_args(self, _argv):
+                    return argparse.Namespace(func=fail, log_path=str(log_path))
+
+            old_build_parser = mod.build_parser
+            try:
+                mod.build_parser = lambda: Parser()
+                self.assertEqual(mod.main([]), 2)
+            finally:
+                mod.build_parser = old_build_parser
+
+            saved = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertFalse(saved["ok"])
+            self.assertEqual(saved["error_type"], "CliError")
+            self.assertEqual(saved["error"], "blocked")
+            self.assertEqual(saved["exit_code"], 2)
+            self.assertIn("finished_at", saved)
+
+    def test_main_writes_structured_failure_log_for_unexpected_error(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "sync.json"
+
+            def fail(_args):
+                raise RuntimeError("unexpected")
+
+            class Parser:
+                def parse_args(self, _argv):
+                    return argparse.Namespace(func=fail, log_path=str(log_path))
+
+            old_build_parser = mod.build_parser
+            try:
+                mod.build_parser = lambda: Parser()
+                self.assertEqual(mod.main([]), 1)
+            finally:
+                mod.build_parser = old_build_parser
+
+            saved = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertFalse(saved["ok"])
+            self.assertEqual(saved["error_type"], "RuntimeError")
+            self.assertEqual(saved["exit_code"], 1)
     def test_codex_catalog_sync_does_not_rewrite_current_files(self):
         mod = load_relay_gate()
         template = {
@@ -1724,3 +1820,90 @@ class ChannelMaintenanceTest(unittest.TestCase):
 
             self.assertTrue(result["written"])
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["availableModels"], ["gpt-5.5"])
+
+    def test_sync_workbuddy_models_reconciles_array_and_preserves_credentials(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "x-old",
+                            "name": "Old",
+                            "vendor": "Buddy",
+                            "apiKey": "workbuddy-secret",
+                            "url": "https://old.example/v1/chat/completions",
+                            "maxInputTokens": 1,
+                            "maxOutputTokens": 2,
+                            "supportsToolCall": True,
+                            "supportsImages": False,
+                            "supportsReasoning": False,
+                            "customFlag": "keep",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = mod._sync_workbuddy_models(
+                path,
+                ["gpt-5.5", "glm-5.2"],
+                "https://newapi.example:8080/",
+                True,
+            )
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([item["id"] for item in saved], ["gpt-5.5", "glm-5.2"])
+            self.assertEqual({item["url"] for item in saved}, {"https://newapi.example:8080/v1/chat/completions"})
+            self.assertEqual({item["apiKey"] for item in saved}, {"workbuddy-secret"})
+            self.assertEqual({item["customFlag"] for item in saved}, {"keep"})
+            self.assertEqual({item["supportsReasoning"] for item in saved}, {True})
+            self.assertTrue(result["written"])
+            self.assertNotIn("workbuddy-secret", json.dumps(result))
+
+    def test_sync_workbuddy_models_rejects_non_array_payload(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.json"
+            original = {"models": [{"id": "gpt-5.5"}]}
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            result = mod._sync_workbuddy_models(path, ["gpt-5.5"], "https://newapi.example:8080", True)
+
+            self.assertEqual(result["error"], "WorkBuddy models file must be a top-level array")
+            self.assertFalse(result["written"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+
+    def test_sync_workbuddy_models_is_idempotent(self):
+        mod = load_relay_gate()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "models.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "gpt-5.5",
+                            "name": "GPT-5.5",
+                            "vendor": "OpenAI",
+                            "apiKey": "workbuddy-secret",
+                            "url": "https://newapi.example:8080/v1/chat/completions",
+                            "maxInputTokens": 256000,
+                            "maxOutputTokens": 128000,
+                            "supportsToolCall": True,
+                            "supportsImages": True,
+                            "supportsReasoning": True,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            first = mod._sync_workbuddy_models(path, ["gpt-5.5"], "https://newapi.example:8080", True)
+            after_first = path.read_text(encoding="utf-8")
+            second = mod._sync_workbuddy_models(path, ["gpt-5.5"], "https://newapi.example:8080", True)
+
+            self.assertFalse(first["needs_repair"])
+            self.assertFalse(second["needs_repair"])
+            self.assertFalse(second["written"])
+            self.assertEqual(path.read_text(encoding="utf-8"), after_first)

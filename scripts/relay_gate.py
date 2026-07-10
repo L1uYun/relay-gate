@@ -38,6 +38,7 @@ DEFAULT_CODEXPLUSPLUS_SETTINGS_PATH = Path.home() / ".codex-session-delete" / "s
 DEFAULT_CC_SWITCH_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_PI_MODELS_PATH = Path.home() / ".pi" / "agent" / "models.json"
 DEFAULT_CODEBUDDY_MODELS_PATH = Path.home() / ".codebuddy" / "models.json"
+DEFAULT_WORKBUDDY_MODELS_PATH = Path.home() / ".workbuddy" / "models.json"
 DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH = Path.home() / ".servitor" / "model_cache" / "pi_models.json"
 DEFAULT_CODEX_CATALOG_TASK_NAME = "CodexModelMenuCacheWatcher"
 DEFAULT_CODEX_CATALOG_LOG_PATH = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "RelayGate" / "codex-catalog-sync.json"
@@ -83,6 +84,24 @@ def _reasoning_presets(efforts: list[str]) -> list[dict[str, str]]:
         "ultra": "Maximum reasoning with automatic task delegation",
     }
     return [{"effort": effort, "description": descriptions[effort]} for effort in efforts]
+
+
+def _with_codex_reasoning_floor(levels: Any) -> list[dict[str, Any]]:
+    floor = ("low", "medium", "high", "xhigh")
+    order = ("none", "minimal", *floor, "max", "ultra")
+    existing: dict[str, dict[str, Any]] = {}
+    unknown: list[dict[str, Any]] = []
+    for item in levels if isinstance(levels, list) else []:
+        if not isinstance(item, dict):
+            continue
+        effort = str(item.get("effort") or "").strip()
+        if effort in order:
+            existing.setdefault(effort, dict(item))
+        else:
+            unknown.append(dict(item))
+    for item in _reasoning_presets(list(floor)):
+        existing.setdefault(item["effort"], item)
+    return [existing[effort] for effort in order if effort in existing] + unknown
 
 
 CODEX_MODEL_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -2865,9 +2884,14 @@ def project_codexplusplus_settings(settings: dict[str, Any], model_ids: list[str
     }
 
 
-def build_codex_catalog_task_action(*, executable: Path, log_path: Path) -> str:
+def build_codex_catalog_task_action(
+    *,
+    pythonw_executable: Path,
+    script_path: Path,
+    log_path: Path,
+) -> str:
     return (
-        f'"{executable}" --json codex-catalog sync --apply '
+        f'"{pythonw_executable}" "{script_path}" --json codex-catalog sync --apply '
         f'--log-path "{log_path}"'
     )
 def build_codex_model_entry(model: str, template: dict[str, Any], priority: int) -> dict[str, Any]:
@@ -2902,7 +2926,9 @@ def build_codex_model_entry(model: str, template: dict[str, Any], priority: int)
     entry["context_window"] = ctx
     entry["max_context_window"] = ctx
     entry["effective_context_window_percent"] = 95
-    return apply_codex_model_override(model, entry)
+    entry = apply_codex_model_override(model, entry)
+    entry["supported_reasoning_levels"] = _with_codex_reasoning_floor(entry.get("supported_reasoning_levels"))
+    return entry
 
 
 def codex_client_version_triplet() -> str:
@@ -3154,19 +3180,27 @@ def sync_codexplusplus_settings_file(settings_path: Path, model_ids: list[str], 
     }
 
 
-def _resolve_relay_gate_executable(explicit: str = "") -> Path:
-    candidate = explicit or shutil.which("relay-gate") or sys.argv[0]
-    return Path(candidate).expanduser().resolve()
+def _resolve_pythonw_executable(explicit: str = "") -> Path:
+    candidate = Path(explicit).expanduser() if explicit else Path(sys.executable).with_name("pythonw.exe")
+    resolved = candidate.resolve()
+    if not resolved.is_file():
+        raise CliError(f"hidden Python executable not found: {resolved}")
+    return resolved
 
 
 def build_codex_catalog_task_create_command(
     *,
-    executable: Path,
+    pythonw_executable: Path,
+    script_path: Path,
     task_name: str,
     interval_minutes: int,
     log_path: Path,
 ) -> list[str]:
-    action = build_codex_catalog_task_action(executable=executable, log_path=log_path)
+    action = build_codex_catalog_task_action(
+        pythonw_executable=pythonw_executable,
+        script_path=script_path,
+        log_path=log_path,
+    )
     return [
         "schtasks.exe",
         "/Create",
@@ -3184,12 +3218,16 @@ def build_codex_catalog_task_create_command(
 
 def command_codex_catalog_task(args: argparse.Namespace) -> int:
     task_name = args.task_name
-    executable = _resolve_relay_gate_executable(getattr(args, "executable", ""))
+    pythonw_executable = _resolve_pythonw_executable(getattr(args, "pythonw_executable", ""))
+    script_path = Path(__file__).resolve()
+    if not script_path.is_file():
+        raise CliError(f"relay-gate script not found: {script_path}")
     log_path = Path(getattr(args, "log_path", DEFAULT_CODEX_CATALOG_LOG_PATH)).expanduser()
     action = args.task_action
     if action == "install":
         command = build_codex_catalog_task_create_command(
-            executable=executable,
+            pythonw_executable=pythonw_executable,
+            script_path=script_path,
             task_name=task_name,
             interval_minutes=args.interval_minutes,
             log_path=log_path,
@@ -3206,7 +3244,11 @@ def command_codex_catalog_task(args: argparse.Namespace) -> int:
         "action": action,
         "task_name": task_name,
         "dry_run": not apply,
-        "task_action": build_codex_catalog_task_action(executable=executable, log_path=log_path),
+        "task_action": build_codex_catalog_task_action(
+            pythonw_executable=pythonw_executable,
+            script_path=script_path,
+            log_path=log_path,
+        ),
         "command": command,
     }
     if apply:
@@ -3317,6 +3359,8 @@ def command_codex_catalog_sync(args: argparse.Namespace) -> int:
             pi_path=Path(getattr(args, "pi_models_path", DEFAULT_PI_MODELS_PATH)).expanduser(),
             pi_cache_path=Path(getattr(args, "pi_models_cache_path", DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH)).expanduser(),
             codebuddy_path=Path(getattr(args, "codebuddy_models_path", DEFAULT_CODEBUDDY_MODELS_PATH)).expanduser(),
+            workbuddy_path=Path(getattr(args, "workbuddy_models_path", DEFAULT_WORKBUDDY_MODELS_PATH)).expanduser(),
+            base_url=getattr(args, "base_url", DEFAULT_BASE_URL),
             agent="all",
             apply=apply,
         )
@@ -3329,7 +3373,7 @@ def command_codex_catalog_sync(args: argparse.Namespace) -> int:
 
 def _model_supports_reasoning(model_id: str) -> bool:
     override = CODEX_MODEL_OVERRIDES.get(model_id) or {}
-    levels = override.get("supported_reasoning_levels") or []
+    levels = _with_codex_reasoning_floor(override.get("supported_reasoning_levels"))
     return any(str(item.get("effort") or "none") != "none" for item in levels if isinstance(item, dict))
 
 
@@ -3420,7 +3464,13 @@ def _sync_pi_models(
     }
 
 
-def _sync_codebuddy_models(cb_path: Path, model_ids: list[str], apply: bool) -> dict[str, Any]:
+def _sync_codebuddy_models(
+    cb_path: Path,
+    model_ids: list[str],
+    apply: bool,
+    *,
+    url_override: str = "",
+) -> dict[str, Any]:
     """Reconcile CodeBuddy custom models and refresh context metadata."""
     config = json.loads(cb_path.read_text(encoding="utf-8"))
     models = config.get("models") if isinstance(config, dict) else config
@@ -3449,6 +3499,8 @@ def _sync_codebuddy_models(cb_path: Path, model_ids: list[str], apply: bool) -> 
         entry["id"] = model_id
         entry["name"] = display_name_for_model(model_id)
         entry["vendor"] = vendor
+        if url_override:
+            entry["url"] = url_override
         entry.setdefault("supportsToolCall", True)
         modalities = (CODEX_MODEL_OVERRIDES.get(model_id) or {}).get("input_modalities") or []
         if modalities:
@@ -3486,12 +3538,42 @@ def _sync_codebuddy_models(cb_path: Path, model_ids: list[str], apply: bool) -> 
     }
 
 
+def _sync_workbuddy_models(
+    workbuddy_path: Path,
+    model_ids: list[str],
+    base_url: str,
+    apply: bool,
+) -> dict[str, Any]:
+    """Reconcile WorkBuddy's top-level custom model array against NewAPI."""
+    config = json.loads(workbuddy_path.read_text(encoding="utf-8"))
+    if not isinstance(config, list):
+        return {
+            "path": str(workbuddy_path),
+            "error": "WorkBuddy models file must be a top-level array",
+            "written": False,
+        }
+    normalized_base = base_url.rstrip("/")
+    endpoint = (
+        f"{normalized_base}/chat/completions"
+        if normalized_base.endswith("/v1")
+        else f"{normalized_base}/v1/chat/completions"
+    )
+    return _sync_codebuddy_models(
+        workbuddy_path,
+        model_ids,
+        apply,
+        url_override=endpoint,
+    )
+
+
 def sync_agent_model_files(
     model_ids: list[str],
     *,
     pi_path: Path,
     pi_cache_path: Path,
     codebuddy_path: Path,
+    workbuddy_path: Path,
+    base_url: str,
     agent: str,
     apply: bool,
 ) -> dict[str, Any]:
@@ -3507,6 +3589,12 @@ def sync_agent_model_files(
             _sync_codebuddy_models(codebuddy_path, model_ids, apply)
             if codebuddy_path.is_file()
             else {"path": str(codebuddy_path), "error": "not found", "written": False}
+        )
+    if agent in ("workbuddy", "all"):
+        result["agents"]["workbuddy"] = (
+            _sync_workbuddy_models(workbuddy_path, model_ids, base_url, apply)
+            if workbuddy_path.is_file()
+            else {"path": str(workbuddy_path), "error": "not found", "written": False}
         )
     return result
 
@@ -3525,6 +3613,8 @@ def command_agent_models_sync(args: argparse.Namespace) -> int:
             pi_path=Path(args.pi_models_path).expanduser(),
             pi_cache_path=Path(args.pi_models_cache_path).expanduser(),
             codebuddy_path=Path(args.codebuddy_models_path).expanduser(),
+            workbuddy_path=Path(getattr(args, "workbuddy_models_path", DEFAULT_WORKBUDDY_MODELS_PATH)).expanduser(),
+            base_url=getattr(args, "base_url", DEFAULT_BASE_URL),
             agent=args.agent,
             apply=apply,
         ),
@@ -3628,7 +3718,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source", choices=["v1-models"], default="v1-models")
     p.set_defaults(func=command_codex_catalog_models)
 
-    p = catalog_sub.add_parser("sync", help="Project the live NewAPI model set into Codex, Codex++, Pi, and CodeBuddy local catalogs.")
+    p = catalog_sub.add_parser("sync", help="Project the live NewAPI model set into Codex, Codex++, Pi, CodeBuddy, and WorkBuddy local catalogs.")
     p.add_argument("--config-path", default=str(DEFAULT_CODEX_CONFIG_PATH))
     p.add_argument("--catalog-path", default=str(DEFAULT_CODEX_CATALOG_PATH))
     p.add_argument("--models-cache-path", default=str(DEFAULT_CODEX_MODELS_CACHE_PATH))
@@ -3646,6 +3736,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pi-models-path", default=str(DEFAULT_PI_MODELS_PATH))
     p.add_argument("--pi-models-cache-path", default=str(DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH))
     p.add_argument("--codebuddy-models-path", default=str(DEFAULT_CODEBUDDY_MODELS_PATH))
+    p.add_argument("--workbuddy-models-path", default=str(DEFAULT_WORKBUDDY_MODELS_PATH))
     p.add_argument("--log-path", default="", help="Write the latest sync result JSON for scheduled runs.")
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
@@ -3657,7 +3748,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = task_sub.add_parser("install", help="Create or replace the relay-gate Codex catalog sync task.")
     p.add_argument("--task-name", default=DEFAULT_CODEX_CATALOG_TASK_NAME)
     p.add_argument("--interval-minutes", type=int, default=5)
-    p.add_argument("--executable", default="", help="relay-gate executable path; defaults to the active CLI.")
+    p.add_argument("--pythonw-executable", default="", help="Hidden Python runtime; defaults to pythonw.exe beside the active interpreter.")
     p.add_argument("--log-path", default=str(DEFAULT_CODEX_CATALOG_LOG_PATH))
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
@@ -3665,27 +3756,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = task_sub.add_parser("status", help="Query the relay-gate Codex catalog sync task.")
     p.add_argument("--task-name", default=DEFAULT_CODEX_CATALOG_TASK_NAME)
-    p.add_argument("--executable", default="")
+    p.add_argument("--pythonw-executable", default="")
     p.add_argument("--log-path", default=str(DEFAULT_CODEX_CATALOG_LOG_PATH))
     p.set_defaults(func=command_codex_catalog_task, dry_run=False, apply=True)
 
     p = task_sub.add_parser("remove", help="Delete the relay-gate Codex catalog sync task.")
     p.add_argument("--task-name", default=DEFAULT_CODEX_CATALOG_TASK_NAME)
-    p.add_argument("--executable", default="")
+    p.add_argument("--pythonw-executable", default="")
     p.add_argument("--log-path", default=str(DEFAULT_CODEX_CATALOG_LOG_PATH))
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=command_codex_catalog_task)
 
-    agent_models = sub.add_parser("agent-models", help="Sync Pi and CodeBuddy model lists from the normalized local NewAPI catalog.")
+    agent_models = sub.add_parser("agent-models", help="Sync Pi, CodeBuddy, and WorkBuddy model lists from the normalized local NewAPI catalog.")
     agent_models_sub = agent_models.add_subparsers(dest="agent_models_command", required=True)
 
-    p = agent_models_sub.add_parser("sync", help="Reconcile model ids and context metadata in Pi and CodeBuddy configs.")
-    p.add_argument("--agent", choices=["pi", "codebuddy", "all"], default="all", help="Which agent config to sync.")
+    p = agent_models_sub.add_parser("sync", help="Reconcile model ids and context metadata in Pi, CodeBuddy, and WorkBuddy configs.")
+    p.add_argument("--agent", choices=["pi", "codebuddy", "workbuddy", "all"], default="all", help="Which agent config to sync.")
     p.add_argument("--catalog-path", default=str(DEFAULT_CODEX_CATALOG_PATH))
     p.add_argument("--pi-models-path", default=str(DEFAULT_PI_MODELS_PATH))
     p.add_argument("--pi-models-cache-path", default=str(DEFAULT_SERVITOR_PI_MODELS_CACHE_PATH))
     p.add_argument("--codebuddy-models-path", default=str(DEFAULT_CODEBUDDY_MODELS_PATH))
+    p.add_argument("--workbuddy-models-path", default=str(DEFAULT_WORKBUDDY_MODELS_PATH))
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=command_agent_models_sync)
@@ -3973,17 +4065,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_cli_failure_log(args: argparse.Namespace, exc: Exception, exit_code: int) -> None:
+    log_path = str(getattr(args, "log_path", "") or "").strip()
+    if not log_path:
+        return
+    payload = {
+        "ok": False,
+        "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "error_type": type(exc).__name__,
+        "error": preview_text(str(exc), limit=2000),
+        "exit_code": exit_code,
+    }
+    try:
+        write_json_atomic(Path(log_path).expanduser(), payload)
+    except OSError as log_exc:
+        print(f"failure log error: {log_exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
     except CliError as exc:
+        _write_cli_failure_log(args, exc, 2)
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except requests.RequestException as exc:
+        _write_cli_failure_log(args, exc, 3)
         print(f"network error: {exc}", file=sys.stderr)
         return 3
+    except Exception as exc:
+        if str(getattr(args, "log_path", "") or "").strip():
+            _write_cli_failure_log(args, exc, 1)
+            print(f"unexpected error: {exc}", file=sys.stderr)
+            return 1
+        raise
 
 
 if __name__ == "__main__":
