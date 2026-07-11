@@ -398,9 +398,22 @@ def effective_apply(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
 
 
-def emit(data: Any, as_json: bool) -> None:
+def is_verbose(args: argparse.Namespace) -> bool:
+    """Whether the user asked for the verbose human surface.
+
+    Verbose expands the default bounded human output with previews, key
+    fingerprints, and diagnostic metadata. Compact (default) human output
+    stays an action summary; --json always carries the full schema.
+    """
+    return bool(getattr(args, "verbose", False))
+
+
+def emit(data: Any, as_json: bool, human_text: str | None = None) -> None:
     if as_json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    if human_text is not None:
+        print(human_text)
         return
     if isinstance(data, str):
         print(data)
@@ -475,7 +488,8 @@ def channel_patch(
     endpoint.
     """
     payload: dict[str, Any] = {"id": channel_id}
-    payload.update({k: v for k, v in fields.items() if v is not None})
+    # Defense in depth: NewAPI rejects PUT bodies that contain status.
+    payload.update({k: v for k, v in fields.items() if v is not None and k != "status"})
     response = api_request(args, "PUT", "/api/channel/", json_body=payload)
     if status is not None:
         api_request(args, "POST", f"/api/channel/{channel_id}/status", json_body={"status": status})
@@ -814,6 +828,12 @@ def preview_text(value: Any, *, limit: int = 300) -> str:
     return text[:limit] + "..."
 
 
+def human_field_text(value: Any, *, limit: int = 300) -> str:
+    if isinstance(value, (dict, list, tuple)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return preview_text(value, limit=limit)
+
+
 def is_sensitive_field(name: Any) -> bool:
     text = str(name).lower()
     exact = {
@@ -946,6 +966,90 @@ def fetch_existing_channels(args: argparse.Namespace) -> list[dict[str, Any]]:
     return items
 
 
+def _human_doctor(payload: dict[str, Any], verbose: bool) -> str:
+    parts = [
+        f"service_success={str(payload.get('service_success')).lower()}",
+        f"version={human_field_text(payload.get('version'), limit=160)}",
+        f"channels={human_field_text(payload.get('channels_total'), limit=80)}",
+    ]
+    if verbose:
+        for key in ("user_id", "admin_api"):
+            value = payload.get(key)
+            if value is not None:
+                parts.append(f"{key}={human_field_text(value, limit=160)}")
+    return " ".join(parts)
+
+
+def _human_channels_list(result: dict[str, Any], page: int, verbose: bool) -> str:
+    total = result.get("total")
+    items = result.get("items") or []
+    lines = [f"channels total={human_field_text(total, limit=80)} showing={len(items)} page={human_field_text(page, limit=80)}"]
+    for item in items:
+        parts = [
+            f"id={human_field_text(item.get('id'), limit=80)}",
+            f"status={human_field_text(item.get('status'), limit=80)}",
+            f"priority={human_field_text(item.get('priority'), limit=80)}",
+            f"weight={human_field_text(item.get('weight'), limit=80)}",
+            f"name={human_field_text(item.get('name'), limit=160)}",
+        ]
+        if verbose:
+            for key in ("group", "tag", "models", "response_time", "test_time"):
+                value = item.get(key)
+                if value is not None:
+                    parts.append(f"{key}={human_field_text(value, limit=300)}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def _human_tokens_list(result: dict[str, Any], verbose: bool) -> str:
+    total = result.get("total")
+    items = result.get("items") or []
+    page = result.get("page")
+    lines = [f"tokens total={human_field_text(total, limit=80)} showing={len(items)} page={human_field_text(page, limit=80)}"]
+    for item in items:
+        quota = "unlimited" if item.get("unlimited_quota") else item.get("remain_quota")
+        models = "all" if not item.get("model_limits_enabled") else item.get("model_limits")
+        parts = [
+            f"id={human_field_text(item.get('id'), limit=80)}",
+            f"status={human_field_text(item.get('status'), limit=80)}",
+            f"name={human_field_text(item.get('name'), limit=160)}",
+            f"group={human_field_text(item.get('group'), limit=160)}",
+            f"quota={human_field_text(quota, limit=160)}",
+            f"models={human_field_text(models, limit=160)}",
+        ]
+        if verbose:
+            for key in ("expired_time", "used_quota", "remain_quota", "accessed_time", "model_limits", "allow_ips"):
+                value = item.get(key)
+                if value is not None:
+                    parts.append(f"{key}={human_field_text(value, limit=300)}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def _human_logs_recent(total: Any, items: list[dict[str, Any]], page: int, verbose: bool) -> str:
+    lines = [f"logs total={human_field_text(total, limit=80)} showing={len(items)} page={human_field_text(page, limit=80)}"]
+    for item in items:
+        parts = [
+            f"id={human_field_text(item.get('id'), limit=80)}",
+            f"type={human_field_text(item.get('type'), limit=80)}",
+            f"model={human_field_text(item.get('model_name'), limit=160)}",
+            f"channel={human_field_text(item.get('channel_name'), limit=160)}",
+            f"token={human_field_text(item.get('token_name'), limit=160)}",
+        ]
+        if verbose:
+            created = item.get("created_at")
+            if created is not None:
+                parts.append(f"created={human_field_text(created, limit=80)}")
+            content = item.get("content")
+            if content is not None:
+                parts.append(f"content_chars={len(str(content))}")
+            other = item.get("other")
+            if other is not None:
+                parts.append(f"other_chars={len(str(other))}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     status = requests.get(args.base_url.rstrip("/") + "/api/status", timeout=args.timeout).json()
     channels = api_request(args, "GET", "/api/channel/", params={"p": 1, "page_size": 1})
@@ -959,7 +1063,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "user_id": str(args.user_id),
         "channels_total": channels.get("data", {}).get("total"),
     }
-    emit(payload, args.json)
+    emit(payload, args.json, _human_doctor(payload, is_verbose(args)))
     return 0
 
 
@@ -982,7 +1086,7 @@ def command_channels_list(args: argparse.Namespace) -> int:
         "total": data.get("data", {}).get("total"),
         "items": [channel_summary(item) for item in items],
     }
-    emit(result, args.json)
+    emit(result, args.json, _human_channels_list(result, args.page, is_verbose(args)))
     return 0
 
 
@@ -1561,7 +1665,9 @@ def command_channel_models_set(args: argparse.Namespace) -> int:
         "changes": changes,
     }
     if effective_apply(args):
-        result["api"] = redacted_tree(channel_patch(args, args.id, after))
+        # NewAPI UpdateChannel rejects PUT bodies that include status.
+        fields_for_put = {k: v for k, v in after.items() if k != "status"}
+        result["api"] = redacted_tree(channel_patch(args, args.id, fields_for_put))
         result["after"] = channel_model_summary(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
     emit(result, args.json)
     return 0
@@ -1598,15 +1704,13 @@ def command_tokens_list(args: argparse.Namespace) -> int:
     )
     payload = data.get("data", {}) if isinstance(data, dict) else {}
     items = payload.get("items") or []
-    emit(
-        {
-            "total": payload.get("total"),
-            "page": payload.get("page"),
-            "page_size": payload.get("page_size"),
-            "items": [token_summary(item) for item in items],
-        },
-        args.json,
-    )
+    result = {
+        "total": payload.get("total"),
+        "page": payload.get("page"),
+        "page_size": payload.get("page_size"),
+        "items": [token_summary(item) for item in items],
+    }
+    emit(result, args.json, _human_tokens_list(result, is_verbose(args)))
     return 0
 
 
@@ -1798,14 +1902,16 @@ def command_logs_recent(args: argparse.Namespace) -> int:
     data = api_request(args, "GET", path, params={"p": args.page, "page_size": args.page_size})
     payload = data.get("data", {}) if isinstance(data, dict) else {}
     items = payload.get("items") or []
+    result = {
+        "total": payload.get("total"),
+        "page": payload.get("page"),
+        "page_size": payload.get("page_size"),
+        "items": [summarize_log_item(item, include_other=args.include_other) for item in items],
+    }
     emit(
-        {
-            "total": payload.get("total"),
-            "page": payload.get("page"),
-            "page_size": payload.get("page_size"),
-            "items": [summarize_log_item(item, include_other=args.include_other) for item in items],
-        },
+        result,
         args.json,
+        _human_logs_recent(payload.get("total"), items, args.page, is_verbose(args)),
     )
     return 0
 
@@ -3630,6 +3736,7 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--proxy-url", default="", help="Optional HTTP proxy for NewAPI admin requests, e.g. http://127.0.0.1:7890")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Expand compact human output with diagnostic fields.")
 
 
 def add_channel_secret_flags(parser: argparse.ArgumentParser, *, required: bool) -> None:

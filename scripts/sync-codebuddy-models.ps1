@@ -103,7 +103,7 @@ function Get-DisplayName($modelId) {
     return $name
 }
 
-$completionUrl = "https://newapi.l1uyun.one:8080/v1/chat/completions"
+$completionUrl = "https://newapi.l1uyun.top:8080/v1/chat/completions"
 $modelsArray = @()
 $availArray = @()
 

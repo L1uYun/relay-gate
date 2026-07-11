@@ -1,5 +1,7 @@
 import argparse
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -15,6 +17,242 @@ def load_relay_gate():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def capture_stdout(call):
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        result = call()
+    return result, stdout.getvalue()
+
+
+class CliOutputContractTest(unittest.TestCase):
+    def test_emit_uses_human_text_without_changing_json_payload(self):
+        mod = load_relay_gate()
+        payload = {"ok": True, "details": {"count": 2}}
+
+        _, human = capture_stdout(lambda: mod.emit(payload, False, "ok count=2"))
+        _, machine = capture_stdout(lambda: mod.emit(payload, True, "ignored"))
+
+        self.assertEqual(human, "ok count=2\n")
+        self.assertEqual(json.loads(machine), payload)
+        self.assertTrue(mod.build_parser().parse_args(["--verbose", "doctor"]).verbose)
+
+    def test_channels_list_human_output_is_compact_while_json_keeps_full_schema(self):
+        mod = load_relay_gate()
+        channel = {
+            "id": 7,
+            "name": "primary",
+            "type": 1,
+            "base_url": "https://provider.example/v1",
+            "models": "model-a,model-b",
+            "group": "default",
+            "status": 1,
+            "priority": 10,
+            "weight": 100,
+            "tag": "core",
+            "response_time": 120,
+            "test_time": 1_700_000_000,
+        }
+        response = {"data": {"total": 1, "items": [channel]}}
+        old_api_request = mod.api_request
+        try:
+            mod.api_request = lambda *_args, **_kwargs: response
+            base_args = dict(
+                page=1,
+                page_size=20,
+                status=None,
+                type_filter=None,
+                group_filter="",
+                id_sort=False,
+            )
+            human_args = argparse.Namespace(**base_args, json=False, verbose=False)
+            json_args = argparse.Namespace(**base_args, json=True, verbose=False)
+
+            _, human = capture_stdout(lambda: mod.command_channels_list(human_args))
+            _, machine = capture_stdout(lambda: mod.command_channels_list(json_args))
+        finally:
+            mod.api_request = old_api_request
+
+        self.assertEqual(len(human.strip().splitlines()), 2)
+        self.assertIn("channels total=1 showing=1 page=1", human)
+        self.assertIn("id=7 status=1 priority=10 weight=100 name=primary", human)
+        self.assertNotIn("provider.example", human)
+        self.assertNotIn("model-a", human)
+        self.assertEqual(json.loads(machine)["items"], [mod.channel_summary(channel)])
+
+    def test_tokens_list_hides_key_and_timestamps_from_default_human_output(self):
+        mod = load_relay_gate()
+        token = {
+            "id": 3,
+            "name": "cli",
+            "status": 1,
+            "expired_time": -1,
+            "remain_quota": 500000,
+            "unlimited_quota": True,
+            "model_limits_enabled": False,
+            "model_limits": "",
+            "allow_ips": "",
+            "group": "default",
+            "cross_group_retry": False,
+            "used_quota": 42,
+            "accessed_time": 1_700_000_001,
+            "key": "dummy-key-material",
+        }
+        response = {"data": {"total": 1, "page": 1, "page_size": 20, "items": [token]}}
+        old_api_request = mod.api_request
+        try:
+            mod.api_request = lambda *_args, **_kwargs: response
+            base_args = dict(keyword="", page=1, page_size=20)
+            human_args = argparse.Namespace(**base_args, json=False, verbose=False)
+            json_args = argparse.Namespace(**base_args, json=True, verbose=False)
+
+            _, human = capture_stdout(lambda: mod.command_tokens_list(human_args))
+            _, machine = capture_stdout(lambda: mod.command_tokens_list(json_args))
+        finally:
+            mod.api_request = old_api_request
+
+        self.assertEqual(len(human.strip().splitlines()), 2)
+        self.assertIn("tokens total=1 showing=1 page=1", human)
+        self.assertIn("id=3 status=1 name=cli group=default quota=unlimited models=all", human)
+        self.assertNotIn("dummy-key", human)
+        self.assertNotIn("1700000001", human)
+        self.assertEqual(json.loads(machine)["items"], [mod.token_summary(token)])
+
+    def test_logs_recent_keeps_raw_payloads_out_of_human_output(self):
+        mod = load_relay_gate()
+        log_item = {
+            "id": 9,
+            "created_at": 1_700_000_002,
+            "type": 2,
+            "username": "operator",
+            "token_name": "cli",
+            "model_name": "model-a",
+            "quota": 15,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "use_time": 1.2,
+            "is_stream": True,
+            "channel": 7,
+            "channel_name": "primary",
+            "token_id": 3,
+            "group": "default",
+            "ip": "192.0.2.10",
+            "content": "diagnostic content marker AUTH-SECRET-SENTINEL",
+            "other": '{"authorization":"OTHER-SECRET-SENTINEL"}',
+        }
+        response = {"data": {"total": 1, "page": 1, "page_size": 20, "items": [log_item]}}
+        old_api_request = mod.api_request
+        try:
+            mod.api_request = lambda *_args, **_kwargs: response
+            base_args = dict(page=1, page_size=20, include_other=False, json=False)
+            quiet_args = argparse.Namespace(**base_args, verbose=False)
+            quiet_args.self = False
+            verbose_args = argparse.Namespace(**base_args, verbose=True)
+            verbose_args.self = False
+            json_args = argparse.Namespace(page=1, page_size=20, include_other=False, json=True, verbose=False)
+            json_args.self = False
+
+            _, quiet = capture_stdout(lambda: mod.command_logs_recent(quiet_args))
+            _, verbose = capture_stdout(lambda: mod.command_logs_recent(verbose_args))
+            _, machine = capture_stdout(lambda: mod.command_logs_recent(json_args))
+        finally:
+            mod.api_request = old_api_request
+
+        self.assertEqual(len(quiet.strip().splitlines()), 2)
+        self.assertIn("logs total=1 showing=1 page=1", quiet)
+        self.assertIn("id=9 type=2 model=model-a channel=primary token=cli", quiet)
+        self.assertNotIn("1700000002", quiet)
+        self.assertNotIn("diagnostic content marker", quiet)
+        self.assertNotIn("AUTH-SECRET-SENTINEL", quiet)
+        self.assertNotIn("OTHER-SECRET-SENTINEL", quiet)
+        self.assertIn("created=1700000002", verbose)
+        self.assertIn(f"content_chars={len(log_item['content'])}", verbose)
+        self.assertIn(f"other_chars={len(log_item['other'])}", verbose)
+        self.assertNotIn("diagnostic content marker", verbose)
+        self.assertNotIn("AUTH-SECRET-SENTINEL", verbose)
+        self.assertNotIn("OTHER-SECRET-SENTINEL", verbose)
+        self.assertLess(len(verbose.encode("utf-8")), 500)
+        self.assertEqual(
+            json.loads(machine)["items"],
+            [mod.summarize_log_item(log_item, include_other=False)],
+        )
+
+    def test_channels_human_output_bounds_large_public_fields(self):
+        mod = load_relay_gate()
+        large = ("x" * 1_000) + " RECORD-SENTINEL"
+        channels = [
+            {
+                "id": index,
+                "name": large,
+                "type": 1,
+                "base_url": "https://provider.example/v1?api_key=not-for-human-output",
+                "models": large,
+                "group": "default",
+                "status": 1,
+                "priority": 10,
+                "weight": 100,
+                "tag": "core",
+                "response_time": 120,
+                "test_time": 1_700_000_000,
+            }
+            for index in range(20)
+        ]
+        response = {"data": {"total": 20, "items": channels}}
+        old_api_request = mod.api_request
+        try:
+            mod.api_request = lambda *_args, **_kwargs: response
+            args = argparse.Namespace(
+                page=1,
+                page_size=20,
+                status=None,
+                type_filter=None,
+                group_filter="",
+                id_sort=False,
+                json=False,
+                verbose=True,
+            )
+            _, human = capture_stdout(lambda: mod.command_channels_list(args))
+        finally:
+            mod.api_request = old_api_request
+
+        self.assertEqual(len(human.strip().splitlines()), 21)
+        self.assertNotIn("RECORD-SENTINEL", human)
+        self.assertNotIn("api_key=not-for-human-output", human)
+        self.assertLess(len(human.encode("utf-8")), 12_000)
+
+    def test_doctor_human_output_is_action_summary_while_json_keeps_diagnostics(self):
+        mod = load_relay_gate()
+
+        class Response:
+            @staticmethod
+            def json():
+                return {"success": True, "data": {"version": "v1", "setup": True}}
+
+        old_get = mod.requests.get
+        old_api_request = mod.api_request
+        try:
+            mod.requests.get = lambda *_args, **_kwargs: Response()
+            mod.api_request = lambda *_args, **_kwargs: {"data": {"total": 4}}
+            base_args = dict(base_url="https://gateway.example", timeout=1, user_id="1")
+            human_args = argparse.Namespace(**base_args, json=False, verbose=False)
+            json_args = argparse.Namespace(**base_args, json=True, verbose=False)
+
+            _, human = capture_stdout(lambda: mod.command_doctor(human_args))
+            _, machine = capture_stdout(lambda: mod.command_doctor(json_args))
+        finally:
+            mod.requests.get = old_get
+            mod.api_request = old_api_request
+
+        self.assertLessEqual(len(human.strip().splitlines()), 3)
+        self.assertIn("service_success=true", human)
+        self.assertIn("version=v1", human)
+        self.assertIn("channels=4", human)
+        self.assertNotIn("raw Authorization", human)
+        self.assertEqual(
+            set(json.loads(machine)),
+            {"ok", "base_url", "service_success", "version", "setup", "admin_api", "user_id", "channels_total"},
+        )
 
 
 class RoutingProposalTest(unittest.TestCase):
@@ -1278,6 +1516,67 @@ class AliasMappingTest(unittest.TestCase):
             mod.parse_model_mapping_value(channel["model_mapping"]),
             {"gpt-5.5": "deepseek-chat", "gpt-5.4": "deepseek-reasoner"},
         )
+
+
+
+class ChannelModelsSetPayloadTest(unittest.TestCase):
+    def test_models_set_apply_excludes_status_from_put(self) -> None:
+        from types import SimpleNamespace
+        import scripts.relay_gate as mod
+
+        calls = []
+
+        def fake_api_request(args, method, path, **kwargs):
+            if method == "GET" and path.startswith("/api/channel/"):
+                return {
+                    "data": {
+                        "id": 29,
+                        "name": "demo",
+                        "status": 1,
+                        "models": "old",
+                        "test_model": "old",
+                        "model_mapping": "",
+                    }
+                }
+            raise AssertionError(f"unexpected api_request {method} {path}")
+
+        def fake_channel_patch(args, channel_id, fields, status=None):
+            calls.append({"channel_id": channel_id, "fields": dict(fields), "status": status})
+            return {"success": True}
+
+        args = SimpleNamespace(
+            id=29,
+            models="glm-5.2",
+            test_model=None,
+            model_mapping=None,
+            json=True,
+            apply=True,
+            dry_run=False,
+        )
+        # effective_apply uses apply/dry_run attrs depending on helper; set both.
+        if not hasattr(args, "include_disabled"):
+            args.include_disabled = False
+
+        orig_api = mod.api_request
+        orig_patch = mod.channel_patch
+        orig_emit = mod.emit
+        orig_apply = mod.effective_apply
+        mod.api_request = fake_api_request
+        mod.channel_patch = fake_channel_patch
+        mod.emit = lambda *a, **k: None
+        mod.effective_apply = lambda a: True
+        try:
+            rc = mod.command_channel_models_set(args)
+        finally:
+            mod.api_request = orig_api
+            mod.channel_patch = orig_patch
+            mod.emit = orig_emit
+            mod.effective_apply = orig_apply
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("status", calls[0]["fields"])
+        self.assertEqual(calls[0]["fields"].get("models"), "glm-5.2")
+        self.assertIsNone(calls[0]["status"])
 
 
 if __name__ == "__main__":
