@@ -85,9 +85,9 @@ relay-gate --json codex-catalog sync --apply --log-path "$env:LOCALAPPDATA\Relay
 
 | 模型 | 本地 context_window | 推理等级 | 依据 |
 |---|---:|---|---|
-| `gpt-5.6-sol` | 372000 | low, medium, high, xhigh, max, ultra | OpenAI Codex bundled `models.json`；Sol 默认 low，multi-agent v2 |
-| `gpt-5.6-terra` | 372000 | low, medium, high, xhigh, max, ultra | OpenAI Codex bundled `models.json`；Terra 默认 medium，multi-agent v2 |
-| `gpt-5.6-luna` | 372000 | low, medium, high, xhigh, max | OpenAI Codex bundled `models.json`；当前 CPA live probe 返回 `auth_unavailable`，目录保留元数据但 `visibility=hide`，不注入 Codex++ modelList |
+| `gpt-5.6-sol` | 216000 (Codex soft) / 272000 (product rated) | low, medium, high, xhigh, max, ultra | OpenAI product context reverted 372k→272k (2026-07); Codex soft compaction 256k; Sol 默认 low，multi-agent v2 |
+| `gpt-5.6-terra` | 216000 (Codex soft) / 272000 (product rated) | low, medium, high, xhigh, max, ultra | Align with Sol product limit; Terra 默认 medium，multi-agent v2 |
+| `gpt-5.6-luna` | 216000 (Codex soft) / 272000 (product rated) | low, medium, high, xhigh, max | Align with Sol product limit；当前 CPA live probe 返回 `auth_unavailable`，目录保留元数据但 `visibility=hide` |
 | `grok-4.5` | 500000 | low, medium, high, xhigh | 当前 CLIProxyAPI xAI provider surface registry + 通用四档下限 |
 | `grok-4.3` | 1000000 | none, low, medium, high, xhigh | 当前 CLIProxyAPI/xAI provider surface + 通用四档下限 |
 | `grok-3-mini` | 1000000 | none, low, medium, high, xhigh | 实际 `/v1/responses` 返回模型为 `grok-4.3`，按当前别名目标收口 |

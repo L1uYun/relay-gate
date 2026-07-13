@@ -237,9 +237,9 @@ class ContextMeta:
         "glm-5.2": 500_000,
         "gpt-5.5": 256_000,
         "gpt-5.5-openai-compact": 256_000,
-        "gpt-5.6-sol": 372_000,
-        "gpt-5.6-terra": 372_000,
-        "gpt-5.6-luna": 372_000,
+        "gpt-5.6-sol": 272_000,  # OpenAI product limit reverted from 372k (2026-07)
+        "gpt-5.6-terra": 272_000,  # keep 5.6 family aligned with Sol product limit
+        "gpt-5.6-luna": 272_000,
         "grok-4.5": 500_000,
         "grok-4.3": 1_000_000,
         "grok-3-mini": 1_000_000,
@@ -254,6 +254,14 @@ class ContextMeta:
     CODEX_PRODUCT_OVERRIDES: dict[str, int] = {
         "glm-5.2": 400_000,
         "workbuddy-glm-5.2": 400_000,
+        # Codex async compaction needs headroom under the 500k upstream hard limit.
+        # Without this, grok-4.5 triggers at ~475k and can grow past 500k before compact finishes.
+        "grok-4.5": 400_000,
+        # OpenAI product context for GPT-5.6 family reverted to 272k (from 372k) to reduce over-billing.
+        # Leave a small async-compaction cushion under the product limit.
+        "gpt-5.6-sol": 216_000,  # 80% of 272k product limit for async compaction headroom
+        "gpt-5.6-terra": 216_000,
+        "gpt-5.6-luna": 216_000,
     }
 
     MAX_OUT_FALLBACK = {
@@ -1470,6 +1478,236 @@ def command_responses_bridge_ensure(args: argparse.Namespace) -> int:
     if effective_apply(args):
         result["api"] = redacted_tree(api_request(args, "PUT", "/api/option/", json_body=payload))
         result["stored"] = True
+    emit(result, args.json)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Groups management (karma #337)
+# ---------------------------------------------------------------------------
+
+GROUP_RATIO_SETTING_KEY = "group_ratio_setting"
+GROUP_RATIO_KEY = "GroupRatio"
+USER_USABLE_GROUPS_KEY = "UserUsableGroups"
+
+
+def _load_option_entry(args, key):
+    """Return (parsed_value, raw_string) for an option key; ({}, "") if absent."""
+    data = api_request(args, "GET", "/api/option/")
+    for item in data.get("data") or []:
+        if item.get("key") != key:
+            continue
+        raw = str(item.get("value") or "").strip()
+        parsed = parse_json_maybe(raw) if raw else {}
+        return parsed if isinstance(parsed, (dict, list)) else {}, raw
+    return {}, ""
+
+
+def _load_group_state(args):
+    """Read the three NewAPI group-related options in one pass."""
+    data = api_request(args, "GET", "/api/option/")
+    options = {}
+    for item in (data.get("data") or []):
+        k = item.get("key")
+        if k:
+            options[k] = str(item.get("value") or "").strip()
+
+    grs_raw = options.get(GROUP_RATIO_SETTING_KEY, "")
+    grs = parse_json_maybe(grs_raw) if grs_raw else {}
+    if not isinstance(grs, dict):
+        grs = {}
+
+    gr_raw = options.get(GROUP_RATIO_KEY, "")
+    gr = parse_json_maybe(gr_raw) if gr_raw else {}
+    if not isinstance(gr, dict):
+        gr = {}
+
+    uug_raw = options.get(USER_USABLE_GROUPS_KEY, "")
+    uug = parse_json_maybe(uug_raw) if uug_raw else []
+    if not isinstance(uug, list):
+        uug = []
+
+    return {
+        "group_ratio_setting": {"raw": grs_raw, "value": grs},
+        "group_ratio": {"raw": gr_raw, "value": gr},
+        "user_usable_groups": {"raw": uug_raw, "value": uug},
+    }
+
+
+def command_groups_list(args):
+    state = _load_group_state(args)
+    grs = state["group_ratio_setting"]["value"]
+    gr = state["group_ratio"]["value"]
+    uug = state["user_usable_groups"]["value"]
+
+    grs_ratio = grs.get("group_ratio") if isinstance(grs, dict) else None
+    if not isinstance(grs_ratio, dict):
+        grs_ratio = {}
+
+    all_names = sorted(set(list(grs_ratio.keys()) + list(gr.keys()) + list(uug)))
+    rows = []
+    for name in all_names:
+        rows.append({
+            "name": name,
+            "group_ratio_setting_ratio": grs_ratio.get(name),
+            "group_ratio": gr.get(name),
+            "user_usable": name in uug,
+        })
+
+    result = {
+        "groups": rows,
+    }
+    emit(result, args.json, _human_groups_list(result))
+    return 0
+
+
+def _human_groups_list(result):
+    lines = []
+    for row in result.get("groups") or []:
+        name = row["name"]
+        usable = "usable" if row["user_usable"] else "not-usable"
+        grs_r = row.get("group_ratio_setting_ratio")
+        gr_r = row.get("group_ratio")
+        lines.append(f"  {name}  ratio_setting={grs_r}  GroupRatio={gr_r}  {usable}")
+    if not lines:
+        return "groups: (none found)"
+    return "groups:\n" + "\n".join(lines)
+
+
+def _compute_group_ensure_plan(state, group_name, ratio):
+    """Compute before/after for the three options. Returns plan with changes list."""
+    grs = state["group_ratio_setting"]["value"]
+    grs_after = dict(grs) if isinstance(grs, dict) else {}
+    grs_ratio_before = dict(grs.get("group_ratio") or {}) if isinstance(grs, dict) else {}
+    if not isinstance(grs_ratio_before, dict):
+        grs_ratio_before = {}
+    grs_ratio_after = dict(grs_ratio_before)
+    grs_ratio_after[group_name] = ratio
+    grs_after["group_ratio"] = grs_ratio_after
+
+    gr = state["group_ratio"]["value"]
+    gr_after = dict(gr) if isinstance(gr, dict) else {}
+    gr_before_val = gr_after.get(group_name)
+    gr_after[group_name] = ratio
+
+    uug = state["user_usable_groups"]["value"]
+    uug_after = list(uug) if isinstance(uug, list) else []
+    uug_before_present = group_name in uug_after
+    if not uug_before_present:
+        uug_after.append(group_name)
+
+    changes = []
+    if grs_ratio_before.get(group_name) != ratio:
+        changes.append({
+            "option": GROUP_RATIO_SETTING_KEY,
+            "field": f"group_ratio.{group_name}",
+            "before": grs_ratio_before.get(group_name),
+            "after": ratio,
+        })
+    if gr_before_val != ratio:
+        changes.append({
+            "option": GROUP_RATIO_KEY,
+            "field": group_name,
+            "before": gr_before_val,
+            "after": ratio,
+        })
+    if not uug_before_present:
+        changes.append({
+            "option": USER_USABLE_GROUPS_KEY,
+            "field": "list",
+            "before": uug_before_present,
+            "after": True,
+        })
+
+    return {
+        "changes": changes,
+        "before": {
+            GROUP_RATIO_SETTING_KEY: grs,
+            GROUP_RATIO_KEY: gr,
+            USER_USABLE_GROUPS_KEY: uug,
+        },
+        "after": {
+            GROUP_RATIO_SETTING_KEY: grs_after,
+            GROUP_RATIO_KEY: gr_after,
+            USER_USABLE_GROUPS_KEY: uug_after,
+        },
+    }
+
+
+def _put_option(args, key, value):
+    payload = {
+        "key": key,
+        "value": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+    }
+    return redacted_tree(api_request(args, "PUT", "/api/option/", json_body=payload))
+
+
+def command_groups_ensure(args):
+    group_name = args.name.strip()
+    if not group_name:
+        raise CliError("--name is required and must not be empty.")
+    ratio = float(args.ratio)
+
+    state = _load_group_state(args)
+    plan = _compute_group_ensure_plan(state, group_name, ratio)
+
+    result = {
+        "dry_run": not effective_apply(args),
+        "group": group_name,
+        "ratio": ratio,
+        "changes": plan["changes"],
+        "before": plan["before"],
+        "after": plan["after"],
+    }
+
+    if not plan["changes"]:
+        result["already_in_sync"] = True
+        result["verification"] = "All three options already contain this group with the same ratio."
+        emit(result, args.json)
+        return 0
+
+    if effective_apply(args):
+        writes = []
+        try:
+            for key in (GROUP_RATIO_SETTING_KEY, GROUP_RATIO_KEY, USER_USABLE_GROUPS_KEY):
+                after_val = plan["after"][key]
+                api_result = _put_option(args, key, after_val)
+                writes.append({"option": key, "ok": True, "api": api_result})
+        except (CliError, requests.RequestException) as exc:
+            writes.append({"option": "partial_failure", "ok": False, "error": str(exc)})
+            result["writes"] = writes
+            result["rollback_attempted"] = True
+            for key in (GROUP_RATIO_SETTING_KEY, GROUP_RATIO_KEY, USER_USABLE_GROUPS_KEY):
+                try:
+                    _put_option(args, key, plan["before"][key])
+                except Exception:
+                    pass
+            result["rollback"] = "Attempted to restore previous values. Verify with: relay-gate --json groups list"
+            emit(result, args.json)
+            return 2
+
+        result["writes"] = writes
+
+        verify_state = _load_group_state(args)
+        grs_ok = (
+            verify_state["group_ratio_setting"]["value"]
+            .get("group_ratio", {})
+            .get(group_name) == ratio
+        )
+        gr_ok = verify_state["group_ratio"]["value"].get(group_name) == ratio
+        uug_ok = group_name in verify_state["user_usable_groups"]["value"]
+        result["verification"] = {
+            "group_ratio_setting": grs_ok,
+            "group_ratio": gr_ok,
+            "user_usable_groups": uug_ok,
+            "all_ok": grs_ok and gr_ok and uug_ok,
+        }
+        if not (grs_ok and gr_ok and uug_ok):
+            result["verification"]["warning"] = (
+                "One or more options did not verify after apply. "
+                "Check with: relay-gate --json groups list"
+            )
+
     emit(result, args.json)
     return 0
 
@@ -4032,6 +4270,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=command_responses_bridge_ensure)
+
+
+    groups = sub.add_parser("groups", help="Manage NewAPI groups: list and atomically ensure group ratio + usable groups.")
+    groups_sub = groups.add_subparsers(dest="groups_command", required=True)
+
+    p = groups_sub.add_parser("list", help="List all groups across the three NewAPI group options.")
+    p.set_defaults(func=command_groups_list)
+
+    p = groups_sub.add_parser("ensure", help="Atomically ensure a group exists in group_ratio_setting.group_ratio, GroupRatio, and UserUsableGroups with read-back verification.")
+    p.add_argument("--name", required=True, help="Group name to ensure.")
+    p.add_argument("--ratio", type=float, default=1.0, help="Ratio value for this group.")
+    p.add_argument("--dry-run", action="store_true", help="Preview only. This is the default unless --apply is set.")
+    p.add_argument("--apply", action="store_true", help="Actually write the three options.")
+    p.set_defaults(func=command_groups_ensure)
+
 
     tokens = sub.add_parser("tokens", help="Manage NewAPI caller tokens.")
     tokens_sub = tokens.add_subparsers(dest="tokens_command", required=True)

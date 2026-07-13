@@ -421,10 +421,10 @@ class RoutingProposalTest(unittest.TestCase):
         }
 
         expected = {
-            "gpt-5.6-sol": (372000, "low", ["low", "medium", "high", "xhigh", "max", "ultra"]),
-            "gpt-5.6-terra": (372000, "medium", ["low", "medium", "high", "xhigh", "max", "ultra"]),
-            "gpt-5.6-luna": (372000, "medium", ["low", "medium", "high", "xhigh", "max"]),
-            "grok-4.5": (500000, "medium", ["low", "medium", "high", "xhigh"]),
+            "gpt-5.6-sol": (216000, "low", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+            "gpt-5.6-terra": (216000, "medium", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+            "gpt-5.6-luna": (216000, "medium", ["low", "medium", "high", "xhigh", "max"]),
+            "grok-4.5": (400000, "medium", ["low", "medium", "high", "xhigh"]),
             "grok-4.3": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
             "grok-3-mini": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
             "grok-3-mini-fast": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
@@ -567,7 +567,7 @@ class RoutingProposalTest(unittest.TestCase):
 
             catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
             sol = next(item for item in catalog["models"] if item["slug"] == "gpt-5.6-sol")
-            self.assertEqual(sol["context_window"], 372000)
+            self.assertEqual(sol["context_window"], 216000)
             self.assertEqual([item["effort"] for item in sol["supported_reasoning_levels"]][-2:], ["max", "ultra"])
             self.assertEqual(sol["base_instructions"], "base")
             cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -2010,7 +2010,7 @@ class ChannelMaintenanceTest(unittest.TestCase):
             old_resolve = mod.ContextMeta.resolve
             try:
                 mod.ContextMeta.resolve = classmethod(
-                    lambda cls, model_id, for_codex=False: ((256000, 128000) if model_id == "gpt-5.5" else (372000, 128000))
+                    lambda cls, model_id, for_codex=False: ((256000, 128000) if model_id == "gpt-5.5" else (272000, 128000))
                 )
                 result = mod._sync_pi_models(path, ["gpt-5.5", "gpt-5.6-sol"], True)
             finally:
@@ -2021,7 +2021,7 @@ class ChannelMaintenanceTest(unittest.TestCase):
             self.assertEqual(saved["providers"]["newapi"]["apiKey"], "newapi-secret")
             self.assertEqual(saved["providers"]["newapi"]["baseUrl"], "https://example.test/v1")
             self.assertEqual([item["id"] for item in saved["providers"]["newapi"]["models"]], ["gpt-5.5", "gpt-5.6-sol"])
-            self.assertEqual(saved["providers"]["newapi"]["models"][1]["contextWindow"], 372000)
+            self.assertEqual(saved["providers"]["newapi"]["models"][1]["contextWindow"], 272000)
             self.assertTrue(saved["providers"]["newapi"]["models"][1]["reasoning"])
             self.assertEqual(result["added"], ["gpt-5.6-sol"])
             self.assertEqual(result["removed"], ["retired-model"])
@@ -2075,7 +2075,7 @@ class ChannelMaintenanceTest(unittest.TestCase):
             old_resolve = mod.ContextMeta.resolve
             try:
                 mod.ContextMeta.resolve = classmethod(
-                    lambda cls, model_id, for_codex=False: ((256000, 128000) if model_id == "gpt-5.5" else (372000, 128000))
+                    lambda cls, model_id, for_codex=False: ((256000, 128000) if model_id == "gpt-5.5" else (272000, 128000))
                 )
                 result = mod._sync_codebuddy_models(path, ["gpt-5.5", "gpt-5.6-sol"], True)
             finally:
@@ -2087,7 +2087,7 @@ class ChannelMaintenanceTest(unittest.TestCase):
             self.assertEqual(saved["models"][1]["apiKey"], "codebuddy-secret")
             self.assertEqual(saved["models"][1]["url"], "https://example.test/v1/chat/completions")
             self.assertEqual(saved["models"][1]["vendor"], "OpenAI")
-            self.assertEqual(saved["models"][1]["maxInputTokens"], 372000)
+            self.assertEqual(saved["models"][1]["maxInputTokens"], 272000)
             self.assertEqual(result["added"], ["gpt-5.6-sol"])
             self.assertNotIn("codebuddy-secret", json.dumps(result))
 
@@ -2206,3 +2206,245 @@ class ChannelMaintenanceTest(unittest.TestCase):
             self.assertFalse(second["needs_repair"])
             self.assertFalse(second["written"])
             self.assertEqual(path.read_text(encoding="utf-8"), after_first)
+
+
+class GroupsEnsureTest(unittest.TestCase):
+    """Tests for the groups list/ensure commands (karma #337)."""
+
+    def _make_args(self, **kwargs):
+        defaults = dict(
+            name="vip",
+            ratio=1.5,
+            dry_run=False,
+            apply=True,
+            json=True,
+        )
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_groups_ensure_dry_run_reports_changes_without_writing(self):
+        mod = load_relay_gate()
+        call_log = []
+
+        def fake_api_request(args, method, path, *, json_body=None, params=None):
+            call_log.append((method, path))
+            if method == "GET" and path == "/api/option/":
+                return {
+                    "data": [
+                        {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1}}'},
+                        {"key": "GroupRatio", "value": '{"default":1}'},
+                        {"key": "UserUsableGroups", "value": '["default"]'},
+                    ]
+                }
+            raise AssertionError(f"unexpected api call: {method} {path}")
+
+        old_api_request = mod.api_request
+        old_emit = mod.emit
+        emitted = []
+        try:
+            mod.api_request = fake_api_request
+            mod.emit = lambda data, as_json: emitted.append(data)
+            args = self._make_args(dry_run=True, apply=False)
+            self.assertEqual(mod.command_groups_ensure(args), 0)
+        finally:
+            mod.api_request = old_api_request
+            mod.emit = old_emit
+
+        # Dry run: no PUT calls
+        put_calls = [c for c in call_log if c[0] == "PUT"]
+        self.assertEqual(put_calls, [])
+        self.assertTrue(emitted[0]["dry_run"])
+        self.assertEqual(len(emitted[0]["changes"]), 3)
+
+    def test_groups_ensure_writes_three_options_and_verifies(self):
+        mod = load_relay_gate()
+        put_bodies = {}
+
+        def fake_api_request(args, method, path, *, json_body=None, params=None):
+            if method == "GET" and path == "/api/option/":
+                # Return current state (group not yet present)
+                return {
+                    "data": [
+                        {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1}}'},
+                        {"key": "GroupRatio", "value": '{"default":1}'},
+                        {"key": "UserUsableGroups", "value": '["default"]'},
+                    ]
+                }
+            if method == "PUT" and path == "/api/option/":
+                put_bodies[json_body["key"]] = json.loads(json_body["value"])
+                return {"success": True}
+            raise AssertionError(f"unexpected api call: {method} {path}")
+
+        # For read-back verification: return the updated state
+        call_count = [0]
+
+        def fake_api_request_verify(args, method, path, *, json_body=None, params=None):
+            call_count[0] += 1
+            if method == "GET" and path == "/api/option/":
+                if call_count[0] == 1:
+                    return {
+                        "data": [
+                            {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1}}'},
+                            {"key": "GroupRatio", "value": '{"default":1}'},
+                            {"key": "UserUsableGroups", "value": '["default"]'},
+                        ]
+                    }
+                else:
+                    return {
+                        "data": [
+                            {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1,"vip":1.5}}'},
+                            {"key": "GroupRatio", "value": '{"default":1,"vip":1.5}'},
+                            {"key": "UserUsableGroups", "value": '["default","vip"]'},
+                        ]
+                    }
+            if method == "PUT" and path == "/api/option/":
+                put_bodies[json_body["key"]] = json.loads(json_body["value"])
+                return {"success": True}
+            raise AssertionError(f"unexpected api call: {method} {path}")
+
+        old_api_request = mod.api_request
+        old_emit = mod.emit
+        emitted = []
+        try:
+            mod.api_request = fake_api_request_verify
+            mod.emit = lambda data, as_json: emitted.append(data)
+            args = self._make_args()
+            self.assertEqual(mod.command_groups_ensure(args), 0)
+        finally:
+            mod.api_request = old_api_request
+            mod.emit = old_emit
+
+        # Three options written
+        self.assertIn("group_ratio_setting", put_bodies)
+        self.assertIn("GroupRatio", put_bodies)
+        self.assertIn("UserUsableGroups", put_bodies)
+
+        # Values correct
+        self.assertEqual(put_bodies["group_ratio_setting"]["group_ratio"]["vip"], 1.5)
+        self.assertEqual(put_bodies["GroupRatio"]["vip"], 1.5)
+        self.assertIn("vip", put_bodies["UserUsableGroups"])
+
+        # Verification passed
+        result = emitted[0]
+        self.assertTrue(result["verification"]["all_ok"])
+        self.assertTrue(result["verification"]["group_ratio_setting"])
+        self.assertTrue(result["verification"]["group_ratio"])
+        self.assertTrue(result["verification"]["user_usable_groups"])
+
+    def test_groups_ensure_already_in_sync_skips_write(self):
+        mod = load_relay_gate()
+        put_calls = []
+
+        def fake_api_request(args, method, path, *, json_body=None, params=None):
+            if method == "GET" and path == "/api/option/":
+                return {
+                    "data": [
+                        {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1,"vip":1.5}}'},
+                        {"key": "GroupRatio", "value": '{"default":1,"vip":1.5}'},
+                        {"key": "UserUsableGroups", "value": '["default","vip"]'},
+                    ]
+                }
+            if method == "PUT":
+                put_calls.append(json_body["key"])
+                return {"success": True}
+            raise AssertionError(f"unexpected api call: {method} {path}")
+
+        old_api_request = mod.api_request
+        old_emit = mod.emit
+        emitted = []
+        try:
+            mod.api_request = fake_api_request
+            mod.emit = lambda data, as_json: emitted.append(data)
+            args = self._make_args()
+            self.assertEqual(mod.command_groups_ensure(args), 0)
+        finally:
+            mod.api_request = old_api_request
+            mod.emit = old_emit
+
+        self.assertEqual(put_calls, [])
+        self.assertTrue(emitted[0]["already_in_sync"])
+
+    def test_groups_ensure_rolls_back_on_partial_failure(self):
+        mod = load_relay_gate()
+        put_count = [0]
+
+        def fake_api_request(args, method, path, *, json_body=None, params=None):
+            if method == "GET" and path == "/api/option/":
+                return {
+                    "data": [
+                        {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1}}'},
+                        {"key": "GroupRatio", "value": '{"default":1}'},
+                        {"key": "UserUsableGroups", "value": '["default"]'},
+                    ]
+                }
+            if method == "PUT" and path == "/api/option/":
+                put_count[0] += 1
+                # Fail on the second PUT (GroupRatio)
+                if put_count[0] == 2:
+                    raise mod.CliError("simulated partial failure")
+                return {"success": True}
+            raise AssertionError(f"unexpected api call: {method} {path}")
+
+        old_api_request = mod.api_request
+        old_emit = mod.emit
+        emitted = []
+        try:
+            mod.api_request = fake_api_request
+            mod.emit = lambda data, as_json: emitted.append(data)
+            args = self._make_args()
+            ret = mod.command_groups_ensure(args)
+        finally:
+            mod.api_request = old_api_request
+            mod.emit = old_emit
+
+        self.assertEqual(ret, 2)
+        self.assertTrue(emitted[0]["rollback_attempted"])
+
+    def test_groups_list_merges_three_sources(self):
+        mod = load_relay_gate()
+
+        def fake_api_request(args, method, path, *, json_body=None, params=None):
+            if method == "GET" and path == "/api/option/":
+                return {
+                    "data": [
+                        {"key": "group_ratio_setting", "value": '{"group_ratio":{"default":1,"alpha":2}}'},
+                        {"key": "GroupRatio", "value": '{"default":1,"beta":3}'},
+                        {"key": "UserUsableGroups", "value": '["default","alpha"]'},
+                    ]
+                }
+            raise AssertionError(f"unexpected api call: {method} {path}")
+
+        old_api_request = mod.api_request
+        old_emit = mod.emit
+        emitted = []
+        try:
+            mod.api_request = fake_api_request
+            mod.emit = lambda data, as_json, human_text=None: emitted.append(data)
+            args = argparse.Namespace(json=True)
+            self.assertEqual(mod.command_groups_list(args), 0)
+        finally:
+            mod.api_request = old_api_request
+            mod.emit = old_emit
+
+        groups = emitted[0]["groups"]
+        names = [g["name"] for g in groups]
+        self.assertEqual(names, ["alpha", "beta", "default"])
+        alpha = [g for g in groups if g["name"] == "alpha"][0]
+        self.assertEqual(alpha["group_ratio_setting_ratio"], 2)
+        self.assertIsNone(alpha["group_ratio"])
+        self.assertTrue(alpha["user_usable"])
+        beta = [g for g in groups if g["name"] == "beta"][0]
+        self.assertIsNone(beta["group_ratio_setting_ratio"])
+        self.assertEqual(beta["group_ratio"], 3)
+        self.assertFalse(beta["user_usable"])
+
+    def test_groups_parser_accepts_list_and_ensure(self):
+        mod = load_relay_gate()
+        parser = mod.build_parser()
+        ns = parser.parse_args(["--json", "groups", "list"])
+        self.assertEqual(ns.func, mod.command_groups_list)
+        ns2 = parser.parse_args(["groups", "ensure", "--name", "vip", "--ratio", "2", "--apply"])
+        self.assertEqual(ns2.func, mod.command_groups_ensure)
+        self.assertTrue(ns2.apply)
+        self.assertEqual(ns2.name, "vip")
+        self.assertEqual(ns2.ratio, 2.0)
