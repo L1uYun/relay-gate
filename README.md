@@ -14,12 +14,23 @@ pip install -e .
 
 Python 3.11+. Dependency: `requests`.
 
+## Output modes
+
+```text
+--output human|json|quiet
+```
+
+- `human` (default): bounded action summary
+- `json`: complete machine schema
+- `quiet`: empty stdout; use files/exit code
+- `--verbose` expands human detail only
+
 ## 30-second start
 
 ```powershell
-relay-gate doctor
+relay-gate doctor --output json
 relay-gate channels list
-relay-gate codex-catalog models
+relay-gate codex-catalog models --output json
 relay-gate agent-models sync --dry-run
 ```
 

@@ -31,8 +31,8 @@ class CliOutputContractTest(unittest.TestCase):
         mod = load_relay_gate()
         payload = {"ok": True, "details": {"count": 2}}
 
-        _, human = capture_stdout(lambda: mod.emit(payload, False, "ok count=2"))
-        _, machine = capture_stdout(lambda: mod.emit(payload, True, "ignored"))
+        _, human = capture_stdout(lambda: mod.emit(payload, "human", "ok count=2"))
+        _, machine = capture_stdout(lambda: mod.emit(payload, "json", "ignored"))
 
         self.assertEqual(human, "ok count=2\n")
         self.assertEqual(json.loads(machine), payload)
@@ -66,8 +66,8 @@ class CliOutputContractTest(unittest.TestCase):
                 group_filter="",
                 id_sort=False,
             )
-            human_args = argparse.Namespace(**base_args, json=False, verbose=False)
-            json_args = argparse.Namespace(**base_args, json=True, verbose=False)
+            human_args = argparse.Namespace(**base_args, output="human", verbose=False)
+            json_args = argparse.Namespace(**base_args, output="json", verbose=False)
 
             _, human = capture_stdout(lambda: mod.command_channels_list(human_args))
             _, machine = capture_stdout(lambda: mod.command_channels_list(json_args))
@@ -104,8 +104,8 @@ class CliOutputContractTest(unittest.TestCase):
         try:
             mod.api_request = lambda *_args, **_kwargs: response
             base_args = dict(keyword="", page=1, page_size=20)
-            human_args = argparse.Namespace(**base_args, json=False, verbose=False)
-            json_args = argparse.Namespace(**base_args, json=True, verbose=False)
+            human_args = argparse.Namespace(**base_args, output="human", verbose=False)
+            json_args = argparse.Namespace(**base_args, output="json", verbose=False)
 
             _, human = capture_stdout(lambda: mod.command_tokens_list(human_args))
             _, machine = capture_stdout(lambda: mod.command_tokens_list(json_args))
@@ -145,12 +145,12 @@ class CliOutputContractTest(unittest.TestCase):
         old_api_request = mod.api_request
         try:
             mod.api_request = lambda *_args, **_kwargs: response
-            base_args = dict(page=1, page_size=20, include_other=False, json=False)
+            base_args = dict(page=1, page_size=20, include_other=False, output="human")
             quiet_args = argparse.Namespace(**base_args, verbose=False)
             quiet_args.self = False
             verbose_args = argparse.Namespace(**base_args, verbose=True)
             verbose_args.self = False
-            json_args = argparse.Namespace(page=1, page_size=20, include_other=False, json=True, verbose=False)
+            json_args = argparse.Namespace(page=1, page_size=20, include_other=False, output="json", verbose=False)
             json_args.self = False
 
             _, quiet = capture_stdout(lambda: mod.command_logs_recent(quiet_args))
@@ -209,7 +209,7 @@ class CliOutputContractTest(unittest.TestCase):
                 type_filter=None,
                 group_filter="",
                 id_sort=False,
-                json=False,
+                output="human",
                 verbose=True,
             )
             _, human = capture_stdout(lambda: mod.command_channels_list(args))
@@ -235,8 +235,8 @@ class CliOutputContractTest(unittest.TestCase):
             mod.requests.get = lambda *_args, **_kwargs: Response()
             mod.api_request = lambda *_args, **_kwargs: {"data": {"total": 4}}
             base_args = dict(base_url="https://gateway.example", timeout=1, user_id="1")
-            human_args = argparse.Namespace(**base_args, json=False, verbose=False)
-            json_args = argparse.Namespace(**base_args, json=True, verbose=False)
+            human_args = argparse.Namespace(**base_args, output="human", verbose=False)
+            json_args = argparse.Namespace(**base_args, output="json", verbose=False)
 
             _, human = capture_stdout(lambda: mod.command_doctor(human_args))
             _, machine = capture_stdout(lambda: mod.command_doctor(json_args))
@@ -260,7 +260,7 @@ class RoutingProposalTest(unittest.TestCase):
     def test_channels_optimize_defaults_to_preview(self):
         mod = load_relay_gate()
         parser = mod.build_parser()
-        args = parser.parse_args(["--json", "channels", "optimize"])
+        args = parser.parse_args(["--output", "json", "channels", "optimize"])
 
         self.assertEqual(args.func, mod.command_channels_optimize)
         self.assertFalse(args.apply)
@@ -385,8 +385,8 @@ class RoutingProposalTest(unittest.TestCase):
         old_emit = mod.emit
         try:
             mod.caller_api_request = fake_caller_api_request
-            mod.emit = lambda data, as_json: emitted.append(data)
-            args = argparse.Namespace(json=True)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
+            args = argparse.Namespace(output="json")
 
             self.assertEqual(mod.command_codex_catalog_models(args), 0)
         finally:
@@ -400,11 +400,11 @@ class RoutingProposalTest(unittest.TestCase):
         mod = load_relay_gate()
         parser = mod.build_parser()
 
-        args = parser.parse_args(["--json", "codex-catalog", "models"])
+        args = parser.parse_args(["--output", "json", "codex-catalog", "models"])
 
         self.assertEqual(args.func, mod.command_codex_catalog_models)
         self.assertEqual(args.source, "v1-models")
-        self.assertTrue(args.json)
+        self.assertEqual(args.output, "json")
 
     def test_missing_model_overrides_match_provider_surfaces(self):
         mod = load_relay_gate()
@@ -476,7 +476,7 @@ class RoutingProposalTest(unittest.TestCase):
         )
 
         self.assertTrue(command.startswith('"D:\\Python3.11.1\\pythonw.exe" "D:\\AgentWork\\tools\\relay-gate\\scripts\\relay_gate.py"'))
-        self.assertIn("--json codex-catalog sync --apply", command)
+        self.assertIn("--output json codex-catalog sync --apply", command)
         self.assertIn('--log-path "C:\\Users\\84618\\AppData\\Local\\RelayGate\\codex-catalog-sync.json"', command)
         self.assertNotIn("powershell", command.lower())
         self.assertNotIn("wscript", command.lower())
@@ -534,7 +534,7 @@ class RoutingProposalTest(unittest.TestCase):
             old_emit = mod.emit_and_optionally_log
             try:
                 mod.live_newapi_model_ids = lambda _args: ["gpt-5.5", "gpt-5.6-sol"]
-                mod.emit_and_optionally_log = lambda data, as_json, json_log="": emitted.append(data)
+                mod.emit_and_optionally_log = lambda data, mode, json_log="": emitted.append(data)
                 args = argparse.Namespace(
                     config_path=str(config_path),
                     catalog_path=str(catalog_path),
@@ -558,7 +558,7 @@ class RoutingProposalTest(unittest.TestCase):
                     log_path="",
                     dry_run=False,
                     apply=True,
-                    json=True,
+                    output="json",
                 )
                 self.assertEqual(mod.command_codex_catalog_sync(args), 0)
             finally:
@@ -598,7 +598,7 @@ class RoutingProposalTest(unittest.TestCase):
         mod = load_relay_gate()
         parser = mod.build_parser()
 
-        args = parser.parse_args(["--json", "codex-catalog", "task", "install", "--interval-minutes", "7", "--dry-run"])
+        args = parser.parse_args(["--output", "json", "codex-catalog", "task", "install", "--interval-minutes", "7", "--dry-run"])
 
         self.assertEqual(args.func, mod.command_codex_catalog_task)
         self.assertEqual(args.task_action, "install")
@@ -618,7 +618,7 @@ class RoutingProposalTest(unittest.TestCase):
         old_emit = mod.emit
         try:
             mod.subprocess.run = lambda command, **_kwargs: calls.append(command) or Result()
-            mod.emit = lambda data, as_json: emitted.append(data)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
             args = argparse.Namespace(
                 task_action="install",
                 task_name="CodexModelMenuCacheWatcher",
@@ -627,7 +627,7 @@ class RoutingProposalTest(unittest.TestCase):
                 log_path=r"C:\Temp\catalog.json",
                 dry_run=False,
                 apply=True,
-                json=True,
+                output="json",
             )
             self.assertEqual(mod.command_codex_catalog_task(args), 0)
         finally:
@@ -641,7 +641,7 @@ class RoutingProposalTest(unittest.TestCase):
         mod = load_relay_gate()
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "nested" / "sync.json"
-            mod.emit_and_optionally_log({"ok": True}, False, str(path))
+            mod.emit_and_optionally_log({"ok": True}, "human", str(path))
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"ok": True})
 
     def test_main_writes_structured_failure_log_for_cli_error(self):
@@ -721,13 +721,13 @@ class RoutingProposalTest(unittest.TestCase):
             try:
                 mod.live_newapi_model_ids = lambda _args: ["gpt-5.5"]
                 mod.write_json_atomic = lambda path, payload: writes.append((path, payload))
-                mod.emit_and_optionally_log = lambda data, as_json, json_log="": emitted.append(data)
+                mod.emit_and_optionally_log = lambda data, mode, json_log="": emitted.append(data)
                 args = argparse.Namespace(
                     config_path=str(config_path), catalog_path=str(catalog_path), models_cache_path=str(cache_path),
                     codex_plus_plus_settings_path=str(root / "missing.json"), cc_switch_db_path=str(root / "missing.db"),
                     caller_token_cred="unused", source="v1-models", include_hidden=False, include_disabled=False,
                     exclude_tag=[], pin_first="gpt-5.5", sync_codex_plus_plus=False, sync_config=False, log_path="",
-                    dry_run=False, apply=True, json=True,
+                    dry_run=False, apply=True, output="json",
                 )
                 self.assertEqual(mod.command_codex_catalog_sync(args), 0)
             finally:
@@ -1469,8 +1469,8 @@ class ResponsesBridgePolicyTest(unittest.TestCase):
         old_emit = mod.emit
         try:
             mod.api_request = fake_api_request
-            mod.emit = lambda data, as_json: emitted.append(data)
-            args = argparse.Namespace(channel_id=[10], model_pattern=["^buddy-.*$"], dry_run=False, apply=True, json=True)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
+            args = argparse.Namespace(channel_id=[10], model_pattern=["^buddy-.*$"], dry_run=False, apply=True, output="json")
 
             self.assertEqual(mod.command_responses_bridge_ensure(args), 0)
             self.assertEqual(emitted[0]["changes"], [{"field": "channel_ids", "added": [10]}, {"field": "model_patterns", "added": ["^buddy-.*$"]}])
@@ -1549,7 +1549,7 @@ class ChannelModelsSetPayloadTest(unittest.TestCase):
             models="glm-5.2",
             test_model=None,
             model_mapping=None,
-            json=True,
+            output="json",
             apply=True,
             dry_run=False,
         )
@@ -1763,7 +1763,7 @@ class ChannelMaintenanceTest(unittest.TestCase):
         mod = load_relay_gate()
         parser = mod.build_parser()
         args = parser.parse_args([
-            "--json",
+            "--output", "json",
             "--base-url",
             "http://127.0.0.1:3000",
             "--admin-token-cred",
@@ -2217,7 +2217,7 @@ class GroupsEnsureTest(unittest.TestCase):
             ratio=1.5,
             dry_run=False,
             apply=True,
-            json=True,
+            output="json",
         )
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -2243,7 +2243,7 @@ class GroupsEnsureTest(unittest.TestCase):
         emitted = []
         try:
             mod.api_request = fake_api_request
-            mod.emit = lambda data, as_json: emitted.append(data)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
             args = self._make_args(dry_run=True, apply=False)
             self.assertEqual(mod.command_groups_ensure(args), 0)
         finally:
@@ -2307,7 +2307,7 @@ class GroupsEnsureTest(unittest.TestCase):
         emitted = []
         try:
             mod.api_request = fake_api_request_verify
-            mod.emit = lambda data, as_json: emitted.append(data)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
             args = self._make_args()
             self.assertEqual(mod.command_groups_ensure(args), 0)
         finally:
@@ -2354,7 +2354,7 @@ class GroupsEnsureTest(unittest.TestCase):
         emitted = []
         try:
             mod.api_request = fake_api_request
-            mod.emit = lambda data, as_json: emitted.append(data)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
             args = self._make_args()
             self.assertEqual(mod.command_groups_ensure(args), 0)
         finally:
@@ -2390,7 +2390,7 @@ class GroupsEnsureTest(unittest.TestCase):
         emitted = []
         try:
             mod.api_request = fake_api_request
-            mod.emit = lambda data, as_json: emitted.append(data)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
             args = self._make_args()
             ret = mod.command_groups_ensure(args)
         finally:
@@ -2419,8 +2419,8 @@ class GroupsEnsureTest(unittest.TestCase):
         emitted = []
         try:
             mod.api_request = fake_api_request
-            mod.emit = lambda data, as_json, human_text=None: emitted.append(data)
-            args = argparse.Namespace(json=True)
+            mod.emit = lambda data, mode, human_text=None: emitted.append(data)
+            args = argparse.Namespace(output="json")
             self.assertEqual(mod.command_groups_list(args), 0)
         finally:
             mod.api_request = old_api_request
@@ -2441,7 +2441,7 @@ class GroupsEnsureTest(unittest.TestCase):
     def test_groups_parser_accepts_list_and_ensure(self):
         mod = load_relay_gate()
         parser = mod.build_parser()
-        ns = parser.parse_args(["--json", "groups", "list"])
+        ns = parser.parse_args(["--output", "json", "groups", "list"])
         self.assertEqual(ns.func, mod.command_groups_list)
         ns2 = parser.parse_args(["groups", "ensure", "--name", "vip", "--ratio", "2", "--apply"])
         self.assertEqual(ns2.func, mod.command_groups_ensure)

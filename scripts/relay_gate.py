@@ -411,13 +411,32 @@ def is_verbose(args: argparse.Namespace) -> bool:
 
     Verbose expands the default bounded human output with previews, key
     fingerprints, and diagnostic metadata. Compact (default) human output
-    stays an action summary; --json always carries the full schema.
+    stays an action summary; --output json always carries the full schema.
     """
     return bool(getattr(args, "verbose", False))
 
 
-def emit(data: Any, as_json: bool, human_text: str | None = None) -> None:
-    if as_json:
+OUTPUT_CHOICES = ("human", "json", "quiet")
+
+
+def output_mode(args: argparse.Namespace, default: str = "human") -> str:
+    mode = getattr(args, "output", None) or default
+    if mode not in OUTPUT_CHOICES:
+        raise CliError(f"invalid --output {mode!r}; choose human|json|quiet")
+    return mode
+
+
+def emit(data: Any, mode: str | bool, human_text: str | None = None) -> None:
+    """Emit result payload.
+
+    mode is human|json|quiet. Bool is not accepted.
+    """
+    if isinstance(mode, bool):
+        raise TypeError("emit() requires --output mode string, not bool")
+    mode = mode or "human"
+    if mode == "quiet":
+        return
+    if mode == "json":
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return
     if human_text is not None:
@@ -426,19 +445,20 @@ def emit(data: Any, as_json: bool, human_text: str | None = None) -> None:
     if isinstance(data, str):
         print(data)
         return
+    # Fallback human: compact JSON if no renderer provided.
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def emit_and_optionally_log(data: Any, as_json: bool, json_log: str = "") -> None:
+def emit_and_optionally_log(data: Any, mode: str | bool, json_log: str = "") -> None:
+    """Always write full JSON to optional log file; stdout follows --output."""
+    if isinstance(mode, bool):
+        raise TypeError("emit_and_optionally_log() requires --output mode string, not bool")
     text = json.dumps(data, ensure_ascii=False, indent=2)
     if json_log:
         log_path = Path(json_log)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(text + "\n", encoding="utf-8")
-    if as_json:
-        print(text)
-        return
-    print(text)
+    emit(data, mode)
 
 
 def api_request(
@@ -1071,7 +1091,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "user_id": str(args.user_id),
         "channels_total": channels.get("data", {}).get("total"),
     }
-    emit(payload, args.json, _human_doctor(payload, is_verbose(args)))
+    emit(payload, output_mode(args), _human_doctor(payload, is_verbose(args)))
     return 0
 
 
@@ -1094,14 +1114,14 @@ def command_channels_list(args: argparse.Namespace) -> int:
         "total": data.get("data", {}).get("total"),
         "items": [channel_summary(item) for item in items],
     }
-    emit(result, args.json, _human_channels_list(result, args.page, is_verbose(args)))
+    emit(result, output_mode(args), _human_channels_list(result, args.page, is_verbose(args)))
     return 0
 
 
 def command_channels_get(args: argparse.Namespace) -> int:
     data = api_request(args, "GET", f"/api/channel/{args.id}")
     channel = data.get("data") or {}
-    emit(redacted_channel(channel), args.json)
+    emit(redacted_channel(channel), output_mode(args))
     return 0
 
 
@@ -1114,7 +1134,7 @@ def command_channels_create(args: argparse.Namespace) -> int:
     }
     if effective_apply(args):
         result["api"] = redacted_tree(api_request(args, "POST", "/api/channel/", json_body=payload))
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -1169,7 +1189,7 @@ def command_channels_update(args: argparse.Namespace) -> int:
         fields_for_put = {k: v for k, v in after.items() if k != "status"}
         result["api"] = redacted_tree(channel_patch(args, args.id, fields_for_put, status=status))
         result["after"] = redacted_channel(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -1240,7 +1260,7 @@ def command_channels_test(args: argparse.Namespace) -> int:
             "ok": overall_ok,
             "tested": results,
         },
-        args.json,
+        output_mode(args),
     )
     return 0 if overall_ok else 1
 
@@ -1452,7 +1472,7 @@ def command_responses_bridge_get(args: argparse.Namespace) -> int:
             "value": policy,
             "raw": raw,
         },
-        args.json,
+        output_mode(args),
     )
     return 0
 
@@ -1478,7 +1498,7 @@ def command_responses_bridge_ensure(args: argparse.Namespace) -> int:
     if effective_apply(args):
         result["api"] = redacted_tree(api_request(args, "PUT", "/api/option/", json_body=payload))
         result["stored"] = True
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -1557,7 +1577,7 @@ def command_groups_list(args):
     result = {
         "groups": rows,
     }
-    emit(result, args.json, _human_groups_list(result))
+    emit(result, output_mode(args), _human_groups_list(result))
     return 0
 
 
@@ -1663,7 +1683,7 @@ def command_groups_ensure(args):
     if not plan["changes"]:
         result["already_in_sync"] = True
         result["verification"] = "All three options already contain this group with the same ratio."
-        emit(result, args.json)
+        emit(result, output_mode(args))
         return 0
 
     if effective_apply(args):
@@ -1682,8 +1702,8 @@ def command_groups_ensure(args):
                     _put_option(args, key, plan["before"][key])
                 except Exception:
                     pass
-            result["rollback"] = "Attempted to restore previous values. Verify with: relay-gate --json groups list"
-            emit(result, args.json)
+            result["rollback"] = "Attempted to restore previous values. Verify with: relay-gate --output json groups list"
+            emit(result, output_mode(args))
             return 2
 
         result["writes"] = writes
@@ -1705,10 +1725,10 @@ def command_groups_ensure(args):
         if not (grs_ok and gr_ok and uug_ok):
             result["verification"]["warning"] = (
                 "One or more options did not verify after apply. "
-                "Check with: relay-gate --json groups list"
+                "Check with: relay-gate --output json groups list"
             )
 
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -1814,13 +1834,13 @@ def recover_channels(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_channels_hold_quota(args: argparse.Namespace) -> int:
     result = hold_quota_channels(args)
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0 if all(item.get("ok") for item in result["results"]) else 1
 
 
 def command_channels_recover(args: argparse.Namespace) -> int:
     result = recover_channels(args)
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0 if all(item.get("ok") for item in result["results"]) else 1
 
 
@@ -1870,7 +1890,7 @@ def command_channel_models_list(args: argparse.Namespace) -> int:
         if not args.include_disabled and int(channel.get("status") or 0) != 1:
             continue
         items.append(channel_model_summary(channel))
-    emit({"total": len(items), "items": items}, args.json)
+    emit({"total": len(items), "items": items}, output_mode(args))
     return 0
 
 
@@ -1907,7 +1927,7 @@ def command_channel_models_set(args: argparse.Namespace) -> int:
         fields_for_put = {k: v for k, v in after.items() if k != "status"}
         result["api"] = redacted_tree(channel_patch(args, args.id, fields_for_put))
         result["after"] = channel_model_summary(api_request(args, "GET", f"/api/channel/{args.id}").get("data") or {})
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -1948,13 +1968,13 @@ def command_tokens_list(args: argparse.Namespace) -> int:
         "page_size": payload.get("page_size"),
         "items": [token_summary(item) for item in items],
     }
-    emit(result, args.json, _human_tokens_list(result, is_verbose(args)))
+    emit(result, output_mode(args), _human_tokens_list(result, is_verbose(args)))
     return 0
 
 
 def command_tokens_get(args: argparse.Namespace) -> int:
     data = api_request(args, "GET", f"/api/token/{args.id}")
-    emit(redacted_token(data.get("data") or {}), args.json)
+    emit(redacted_token(data.get("data") or {}), output_mode(args))
     return 0
 
 
@@ -1986,7 +2006,7 @@ def command_tokens_create(args: argparse.Namespace) -> int:
                 )
                 result["stored"] = args.store_cred
                 result["key"] = redact_secret_field(key)
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -2022,7 +2042,7 @@ def command_tokens_update(args: argparse.Namespace) -> int:
     if effective_apply(args):
         result["api"] = redacted_tree(api_request(args, "PUT", "/api/token/", json_body=after))
         result["after"] = redacted_token(api_request(args, "GET", f"/api/token/{args.id}").get("data") or {})
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -2047,7 +2067,7 @@ def command_tokens_key(args: argparse.Namespace) -> int:
             ),
         )
         result["stored"] = args.store_cred
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -2095,7 +2115,7 @@ def command_tokens_ensure_self(args: argparse.Namespace) -> int:
             "key": redact(key),
             "stored": args.cred_name if args.store else None,
         },
-        args.json,
+        output_mode(args),
     )
     return 0
 
@@ -2148,7 +2168,7 @@ def command_logs_recent(args: argparse.Namespace) -> int:
     }
     emit(
         result,
-        args.json,
+        output_mode(args),
         _human_logs_recent(payload.get("total"), items, args.page, is_verbose(args)),
     )
     return 0
@@ -2156,7 +2176,7 @@ def command_logs_recent(args: argparse.Namespace) -> int:
 
 def command_logs_stats(args: argparse.Namespace) -> int:
     data = api_request(args, "GET", "/api/log/stat")
-    emit(data.get("data") if isinstance(data, dict) else data, args.json)
+    emit(data.get("data") if isinstance(data, dict) else data, output_mode(args))
     return 0
 
 
@@ -2851,7 +2871,7 @@ def run_channel_optimization(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_channels_optimize(args: argparse.Namespace) -> int:
-    emit(run_channel_optimization(args), args.json)
+    emit(run_channel_optimization(args), output_mode(args))
     return 0
 
 
@@ -3092,7 +3112,7 @@ def run_channel_maintenance(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_channels_maintain(args: argparse.Namespace) -> int:
     result = run_channel_maintenance(args)
-    emit_and_optionally_log(result, args.json, getattr(args, "json_log", "") or "")
+    emit_and_optionally_log(result, output_mode(args), getattr(args, "json_log", "") or "")
     return 0
 
 
@@ -3235,7 +3255,7 @@ def build_codex_catalog_task_action(
     log_path: Path,
 ) -> str:
     return (
-        f'"{pythonw_executable}" "{script_path}" --json codex-catalog sync --apply '
+        f'"{pythonw_executable}" "{script_path}" --output json codex-catalog sync --apply '
         f'--log-path "{log_path}"'
     )
 def build_codex_model_entry(model: str, template: dict[str, Any], priority: int) -> dict[str, Any]:
@@ -3333,7 +3353,7 @@ def live_newapi_model_ids(args: argparse.Namespace) -> list[str]:
 
 def command_codex_catalog_models(args: argparse.Namespace) -> int:
     model_ids = live_newapi_model_ids(args)
-    emit({"source": getattr(args, "source", "v1-models"), "count": len(model_ids), "models": model_ids}, args.json)
+    emit({"source": getattr(args, "source", "v1-models"), "count": len(model_ids), "models": model_ids}, output_mode(args))
     return 0
 
 
@@ -3611,9 +3631,9 @@ def command_codex_catalog_task(args: argparse.Namespace) -> int:
         result["stdout"] = proc.stdout.strip()
         result["stderr"] = proc.stderr.strip()
         if proc.returncode != 0:
-            emit(result, args.json)
+            emit(result, output_mode(args))
             return proc.returncode
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -3711,7 +3731,7 @@ def command_codex_catalog_sync(args: argparse.Namespace) -> int:
     else:
         result["agent_models"] = {"skipped": True, "agents": {}}
 
-    emit_and_optionally_log(result, args.json, getattr(args, "log_path", "") or "")
+    emit_and_optionally_log(result, output_mode(args), getattr(args, "log_path", "") or "")
     return 0
 
 
@@ -3963,7 +3983,7 @@ def command_agent_models_sync(args: argparse.Namespace) -> int:
             apply=apply,
         ),
     }
-    emit(result, args.json)
+    emit(result, output_mode(args))
     return 0
 
 
@@ -3973,8 +3993,13 @@ def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--user-id", default=DEFAULT_USER_ID)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--proxy-url", default="", help="Optional HTTP proxy for NewAPI admin requests, e.g. http://127.0.0.1:7890")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--verbose", action="store_true", help="Expand compact human output with diagnostic fields.")
+    parser.add_argument(
+        "--output",
+        choices=OUTPUT_CHOICES,
+        default="human",
+        help="Stdout mode: human (default), json, or quiet.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Human-only: expand compact human output with diagnostic fields.")
 
 
 def add_channel_secret_flags(parser: argparse.ArgumentParser, *, required: bool) -> None:
