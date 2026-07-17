@@ -26,6 +26,8 @@ from typing import Any
 
 import requests
 
+from scripts.cliproxy_mgmt import register_cliproxy_commands
+
 
 DEFAULT_BASE_URL = "https://newapi.l1uyun.top:8080"
 DEFAULT_ADMIN_TOKEN_CRED = "l1uyun-newapi-admin-access-token"
@@ -4072,7 +4074,7 @@ def add_bool_pair(parser: argparse.ArgumentParser, name: str, *, dest: str, defa
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage the personal NewAPI gateway."
+        description="Manage the personal NewAPI gateway and CLIProxyAPI management surfaces."
     )
     add_common_flags(parser)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -4433,6 +4435,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--cred-name", default=DEFAULT_GENERAL_TOKEN_CRED)
     p.set_defaults(func=command_tokens_ensure_self)
+
+    register_cliproxy_commands(sub)
 
     logs = sub.add_parser("logs", help="Read NewAPI usage/admin logs without secrets.")
     logs_sub = logs.add_subparsers(dest="logs_command", required=True)

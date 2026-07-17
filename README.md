@@ -43,6 +43,7 @@ relay-gate agent-models sync --dry-run
 - `responses-bridge get|ensure`
 - `groups list|ensure`
 - `tokens list|get|create|update`
+- `cliproxy doctor|auth-files|api-keys|config|logs|debug` — CLIProxyAPI management (Sigil `cliproxy-mgmt-key`; see docs/cliproxy-management.md)
 
 List/get paths are designed to avoid printing upstream keys or caller secrets.
 
