@@ -247,6 +247,7 @@ class ContextMeta:
         "grok-3-mini": 1_000_000,
         "grok-3-mini-fast": 1_000_000,
         "workbuddy-glm-5.2": 500_000,
+        "kimi-for-coding": 200_000,
     }
 
     # Codex Desktop uses context_window as an ASYNC compaction trigger, not a hard
@@ -264,6 +265,7 @@ class ContextMeta:
         "gpt-5.6-sol": 216_000,  # 80% of 272k product limit for async compaction headroom
         "gpt-5.6-terra": 216_000,
         "gpt-5.6-luna": 216_000,
+        "kimi-for-coding": 200_000,  # user override to 200k context window
     }
 
     MAX_OUT_FALLBACK = {
