@@ -70,7 +70,7 @@ if (-not $ApiKey) {
 }
 
 Write-Output "Querying relay-gate enabled channel models ..."
-$rgJson = & relay-gate --json channels list --status 1 --page-size 100
+$rgJson = & relay-gate --output json channels list --status 1 --page-size 100
 $response = $rgJson | ConvertFrom-Json
 
 $modelIds = @()

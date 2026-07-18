@@ -74,12 +74,12 @@ cc-switch 切换 provider 时把这三份写进 `~/.codex/` 的三个文件。**
 `CodexModelMenuCacheWatcher` 计划任务现在每 5 分钟直接执行：
 
 ```powershell
-relay-gate --json codex-catalog sync --apply --log-path "$env:LOCALAPPDATA\RelayGate\codex-catalog-sync.json"
+relay-gate --output json codex-catalog sync --apply --log-path "$env:LOCALAPPDATA\RelayGate\codex-catalog-sync.json"
 ```
 
 任务 action 已从 `wscript -> launch-codex-model-menu-cache-watcher.vbs -> pwsh -Watch` 改为 `pythonw.exe -> relay_gate.py`。`pythonw.exe` 无控制台窗口；成功与失败都通过任务退出码和 `%LOCALAPPDATA%\RelayGate\codex-catalog-sync.json` 观察，不弹黑窗口。这一条任务同时维护 Codex、Codex++、Pi、CodeBuddy、WorkBuddy 和 servitor 动态发现面，不再需要单独的 agent 模型同步任务。旧 VBS/PowerShell watcher 保留为兼容/诊断脚本，但不再拥有自动同步生命周期；失效的 Statsig/LevelDB patch 也不再位于计划任务关键路径。旧的禁用任务 `CodexCatalogSync` 已删除，避免被误认成第二个同步 owner。
 
-计划任务损坏或被删除时，使用同一个 CLI 重新安装：`relay-gate --json codex-catalog task install --interval-minutes 5 --apply`。这也是计划任务层的一命令回滚/重建入口。
+计划任务损坏或被删除时，使用同一个 CLI 重新安装：`relay-gate --output json codex-catalog task install --interval-minutes 5 --apply`。这也是计划任务层的一命令回滚/重建入口。
 
 ### 5. 本次补齐的模型元数据
 
@@ -135,13 +135,13 @@ config.toml/catalog/auth 三个文件 Codex++ 会自动写进 `~/.codex/`（和 
 - Codex auth：`C:\Users\84618\.codex\auth.json`
 - Codex models_cache：`C:\Users\84618\.codex\models_cache.json`
 - relay-gate CLI：`D:\Python3.11.1\Scripts\relay-gate.exe`（editable source：`D:\AgentWork\tools\relay-gate\scripts\relay_gate.py`）
-- 自动同步命令：`relay-gate --json codex-catalog sync --apply`
+- 自动同步命令：`relay-gate --output json codex-catalog sync --apply`
 - 计划任务：`CodexModelMenuCacheWatcher`（每 5 分钟由 `pythonw.exe` 无窗口执行 editable `relay_gate.py`）
 - 同步结果：`%LOCALAPPDATA%\RelayGate\codex-catalog-sync.json`
 - Pi NewAPI 模型：`C:\Users\84618\.pi\agent\models.json`
 - CodeBuddy 第三方模型：`C:\Users\84618\.codebuddy\models.json`
 - WorkBuddy 第三方模型：`C:\Users\84618\.workbuddy\models.json`
-- 子代理手动同步：`relay-gate --json agent-models sync --apply`
+- 子代理手动同步：`relay-gate --output json agent-models sync --apply`
 - 旧 watcher 脚本：`D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1`（仅兼容/诊断，不再由计划任务调用）
 
 ## 验证方法
@@ -150,8 +150,8 @@ config.toml/catalog/auth 三个文件 Codex++ 会自动写进 `~/.codex/`（和 
 
 ```powershell
 python -m unittest discover -s D:\AgentWork\tools\relay-gate\tests -p "test_*.py"
-relay-gate --json codex-catalog sync --dry-run
-relay-gate --json codex-catalog task status
+relay-gate --output json codex-catalog sync --dry-run
+relay-gate --output json codex-catalog task status
 ```
 
 测试覆盖：cc-switch 简化 `modelCatalog` 规格展开、上游只有 id 时的完整模板合成、模型上下文/推理覆盖、Codex++ active profile 投影、Pi/CodeBuddy/WorkBuddy 适配投影、幂等写入、结构化失败日志，以及计划任务必须通过 `pythonw.exe` 无窗口调用 editable `relay_gate.py`。实际应用后，`written=false` 表示目录已经一致，不会每 5 分钟重复改写文件。
