@@ -1,0 +1,59 @@
+{
+  "slice": "relay-gate-rust-read-only-core",
+  "liber_null_id": 305,
+  "contract_tokens": [
+    "agent_native_cli",
+    "read_only_surface",
+    "secret_redaction",
+    "grok_4_5_context_window"
+  ],
+  "controller_verification": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo test",
+      "cargo build --release"
+    ],
+    "result": "pass",
+    "tests": {
+      "library": 20,
+      "integration": 12,
+      "doctest": 1
+    },
+    "release_smoke": {
+      "sha256": "638FDE253A153FBBD75C8FF240539504F7D95C7E6CF6BDB23EDA0B02C8882E2E",
+      "schema": {
+        "exit_code": 0,
+        "schema_version": "relay-gate.v1",
+        "mutation_allowed": false,
+        "http_method": "GET"
+      },
+      "missing_credential": {
+        "exit_code": 1,
+        "error_code": "credential",
+        "raw_token_emitted": false
+      }
+    }
+  },
+  "reviews": [
+    {
+      "run_id": "019f94ac-e482-7d71-bb4e-88884308e2c2",
+      "model": "hy3",
+      "verdict": "changes_required",
+      "resolved": [
+        "CLI subprocess coverage",
+        "tokens and self-log fixture coverage",
+        "client timeout"
+      ]
+    },
+    {
+      "run_id": "019f94b2-e5d9-7a10-8d19-2345da618953",
+      "model": "hy3",
+      "verdict": "pass",
+      "findings": []
+    }
+  ],
+  "catalog": {
+    "grok_4_5_context_window": 200000
+  }
+}
