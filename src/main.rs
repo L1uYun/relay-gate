@@ -4,8 +4,13 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use relay_gate::{
-    ChannelsGetSelector, ChannelsListSelector, Client, Envelope, Error, LogsRecentSelector,
-    TokensGetSelector, TokensListSelector, schema,
+    ChannelsCreateSelector, ChannelsGetSelector, ChannelsListSelector,
+    ChannelsStatusSelector, ChannelsTestSelector, ChannelsUpdateSelector,
+    Client, Envelope, Error, LogsRecentSelector, LogsStatsSelector,
+    ModelsListSelector, OptionsListSelector, OptionsSetSelector,
+    TokensCreateSelector, TokensGetSelector, TokensKeySelector,
+    TokensListSelector, TokensUpdateSelector,
+    schema,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -14,7 +19,7 @@ use serde_json::Value;
 #[command(
     name = "relay-gate",
     version,
-    about = "Read-only NewAPI Relay Gate core"
+    about = "NewAPI Relay Gate CLI"
 )]
 struct Cli {
     /// Override the NewAPI base URL (default: https://newapi.l1uyun.top:8080).
@@ -43,12 +48,12 @@ enum Command {
     Schema,
     /// Structural preflight (GET /api/status + /api/channel/).
     Doctor,
-    /// Channel inventory.
+    /// Channel inventory and management.
     Channels {
         #[command(subcommand)]
         action: ChannelsAction,
     },
-    /// Caller token inventory.
+    /// Caller token inventory and management.
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
@@ -58,19 +63,47 @@ enum Command {
         #[command(subcommand)]
         action: LogsAction,
     },
+    /// NewAPI global options.
+    Options {
+        #[command(subcommand)]
+        action: OptionsAction,
+    },
+    /// Model discovery via caller API.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum ChannelsAction {
     /// List channels (paginated).
     List {
-        /// Selector JSON: {"page":u32?,"page_size":u32?,"status":i32?,"type":i32?,"group":str?,"id_sort":bool?}
         #[arg(long)]
         input: Option<String>,
     },
     /// Get a single channel by id.
     Get {
-        /// Selector JSON: {"id":u64}
+        #[arg(long)]
+        input: String,
+    },
+    /// Create a new channel.
+    Create {
+        #[arg(long)]
+        input: String,
+    },
+    /// Update channel fields (PATCH semantics; body = id + fields).
+    Update {
+        #[arg(long)]
+        input: String,
+    },
+    /// Set channel status (1=enabled, 2=disabled, 3=auto-disabled).
+    Status {
+        #[arg(long)]
+        input: String,
+    },
+    /// Test a channel by id.
+    Test {
         #[arg(long)]
         input: String,
     },
@@ -80,13 +113,26 @@ enum ChannelsAction {
 enum TokensAction {
     /// List caller tokens.
     List {
-        /// Selector JSON: {"keyword":str?,"page":u32?,"page_size":u32?}
         #[arg(long)]
         input: Option<String>,
     },
     /// Get a single token by id.
     Get {
-        /// Selector JSON: {"id":u64}
+        #[arg(long)]
+        input: String,
+    },
+    /// Create a caller token.
+    Create {
+        #[arg(long)]
+        input: String,
+    },
+    /// Update token fields.
+    Update {
+        #[arg(long)]
+        input: String,
+    },
+    /// Regenerate token key.
+    Key {
         #[arg(long)]
         input: String,
     },
@@ -96,10 +142,31 @@ enum TokensAction {
 enum LogsAction {
     /// Recent gateway logs.
     Recent {
-        /// Selector JSON: {"page":u32?,"page_size":u32?,"self":bool?}
         #[arg(long)]
         input: Option<String>,
     },
+    /// Aggregate log stats.
+    Stats,
+}
+
+#[derive(Subcommand, Debug)]
+enum OptionsAction {
+    /// List NewAPI options.
+    List {
+        #[arg(long)]
+        input: Option<String>,
+    },
+    /// Set a NewAPI option.
+    Set {
+        #[arg(long)]
+        input: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelsAction {
+    /// List models exposed via caller API.
+    List,
 }
 
 fn main() -> ExitCode {
@@ -121,12 +188,19 @@ fn run(cli: Cli) -> bool {
         return emit(&env, mode, pretty, None);
     }
 
-    let client = match Client::from_env(base_url) {
-        Ok(c) => c,
-        Err(err) => {
-            let env = Envelope::err(operation, err);
-            return emit(&env, mode, pretty, None);
+    // Models list uses a caller token, not admin; allow empty admin for that command.
+    let needs_admin = !matches!(&cli.command, Command::Models { .. });
+    let client = if needs_admin {
+        match Client::from_env(base_url) {
+            Ok(c) => c,
+            Err(err) => {
+                let env = Envelope::err(operation, err);
+                return emit(&env, mode, pretty, None);
+            }
         }
+    } else {
+        // Models list: create a client with empty admin token (not used).
+        Client::new_caller(base_url.unwrap_or(relay_gate::DEFAULT_BASE_URL)).unwrap()
     };
 
     let result = execute(&cli.command, &client);
@@ -144,13 +218,28 @@ fn operation_name(cmd: &Command) -> &'static str {
         Command::Channels { action } => match action {
             ChannelsAction::List { .. } => "channels.list",
             ChannelsAction::Get { .. } => "channels.get",
+            ChannelsAction::Create { .. } => "channels.create",
+            ChannelsAction::Update { .. } => "channels.update",
+            ChannelsAction::Status { .. } => "channels.status",
+            ChannelsAction::Test { .. } => "channels.test",
         },
         Command::Tokens { action } => match action {
             TokensAction::List { .. } => "tokens.list",
             TokensAction::Get { .. } => "tokens.get",
+            TokensAction::Create { .. } => "tokens.create",
+            TokensAction::Update { .. } => "tokens.update",
+            TokensAction::Key { .. } => "tokens.key",
         },
         Command::Logs { action } => match action {
             LogsAction::Recent { .. } => "logs.recent",
+            LogsAction::Stats => "logs.stats",
+        },
+        Command::Options { action } => match action {
+            OptionsAction::List { .. } => "options.list",
+            OptionsAction::Set { .. } => "options.set",
+        },
+        Command::Models { action } => match action {
+            ModelsAction::List => "models.list",
         },
     }
 }
@@ -168,6 +257,22 @@ fn execute(cmd: &Command, client: &Client) -> Result<Value, Error> {
                 let sel: ChannelsGetSelector = parse_selector(Some(input.as_str()))?;
                 relay_gate::channels_get(client, &sel)
             }
+            ChannelsAction::Create { input } => {
+                let sel: ChannelsCreateSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::channels_create(client, &sel)
+            }
+            ChannelsAction::Update { input } => {
+                let sel: ChannelsUpdateSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::channels_update(client, &sel)
+            }
+            ChannelsAction::Status { input } => {
+                let sel: ChannelsStatusSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::channels_status(client, &sel)
+            }
+            ChannelsAction::Test { input } => {
+                let sel: ChannelsTestSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::channels_test(client, &sel)
+            }
         },
         Command::Tokens { action } => match action {
             TokensAction::List { input } => {
@@ -178,11 +283,43 @@ fn execute(cmd: &Command, client: &Client) -> Result<Value, Error> {
                 let sel: TokensGetSelector = parse_selector(Some(input.as_str()))?;
                 relay_gate::tokens_get(client, &sel)
             }
+            TokensAction::Create { input } => {
+                let sel: TokensCreateSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::tokens_create(client, &sel)
+            }
+            TokensAction::Update { input } => {
+                let sel: TokensUpdateSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::tokens_update(client, &sel)
+            }
+            TokensAction::Key { input } => {
+                let sel: TokensKeySelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::tokens_key(client, &sel)
+            }
         },
         Command::Logs { action } => match action {
             LogsAction::Recent { input } => {
                 let sel: LogsRecentSelector = parse_selector(input.as_deref())?;
                 relay_gate::logs_recent(client, &sel)
+            }
+            LogsAction::Stats => {
+                let sel: LogsStatsSelector = parse_selector(None)?;
+                relay_gate::logs_stats(client, &sel)
+            }
+        },
+        Command::Options { action } => match action {
+            OptionsAction::List { input } => {
+                let sel: OptionsListSelector = parse_selector(input.as_deref())?;
+                relay_gate::options_list(client, &sel)
+            }
+            OptionsAction::Set { input } => {
+                let sel: OptionsSetSelector = parse_selector(Some(input.as_str()))?;
+                relay_gate::options_set(client, &sel)
+            }
+        },
+        Command::Models { action } => match action {
+            ModelsAction::List => {
+                let sel: ModelsListSelector = parse_selector(None)?;
+                relay_gate::models_list(client, &sel)
             }
         },
     }

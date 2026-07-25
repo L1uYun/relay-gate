@@ -242,6 +242,28 @@ impl Client {
     }
 
     /// Base URL the client targets.
+    /// Build a client without admin token validation.
+    ///
+    /// Used for caller-only commands (models list) that do not call admin endpoints.
+    pub fn new_caller(base_url: impl Into<String>) -> Result<Self, Error> {
+        let base_url = base_url.into();
+        if base_url.is_empty() {
+            return Err(Error::Credential("base_url is empty".into()));
+        }
+        let http = reqwest::blocking::Client::builder()
+            .connect_timeout(DEFAULT_REQUEST_TIMEOUT)
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| Error::Credential(format!("http client build failed: {e}")))?;
+        Ok(Self {
+            base_url,
+            admin_token: String::new(),
+            user_id: String::new(),
+            http,
+        })
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -296,6 +318,83 @@ impl Client {
                 message: self.redact(&format!(
                     "non-JSON response body (status {status}): {preview}"
                 )),
+            }
+        })?;
+        if let Some(false) = parsed.get("success").and_then(Value::as_bool) {
+            let message = parsed
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("(no message)")
+                .to_string();
+            return Err(Error::NewApi {
+                path: path.to_string(),
+                message: self.redact(&message),
+            });
+        }
+        Ok(parsed)
+    }
+
+    /// Issue a POST request with an optional JSON body and return the parsed JSON body.
+    ///
+    /// Mirrors [`get`](Self::get) for auth, timeout, redaction, and NewAPI
+    /// `success: false` handling. Used by create/status/key operations.
+    pub fn post(&self, path: &str, body: Option<&Value>) -> Result<Value, Error> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Authorization", &self.admin_token)
+            .header("New-Api-User", &self.user_id);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        self.send_and_parse(req, path)
+    }
+
+    /// Issue a PUT request with a JSON body and return the parsed JSON body.
+    ///
+    /// Mirrors [`get`](Self::get) for auth, timeout, redaction, and NewAPI
+    /// `success: false` handling. Used by channel/token update and option set.
+    pub fn put(&self, path: &str, body: &Value) -> Result<Value, Error> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let req = self
+            .http
+            .put(&url)
+            .header("Authorization", &self.admin_token)
+            .header("New-Api-User", &self.user_id)
+            .json(body);
+        self.send_and_parse(req, path)
+    }
+
+    /// Shared send + parse + redact logic for post/put.
+    fn send_and_parse(
+        &self,
+        req: reqwest::blocking::RequestBuilder,
+        path: &str,
+    ) -> Result<Value, Error> {
+        let resp = req.send().map_err(|e| Error::Http {
+            status: 0,
+            path: path.to_string(),
+            message: self.redact(&format!("transport: {e}")),
+        })?;
+        let status = resp.status().as_u16();
+        let text = resp.text().map_err(|e| Error::Http {
+            status,
+            path: path.to_string(),
+            message: self.redact(&format!("response body unreadable: {e}")),
+        })?;
+        if status >= 400 {
+            return Err(Error::Http {
+                status,
+                path: path.to_string(),
+                message: self.redact(&text),
+            });
+        }
+        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+            let preview: String = text.chars().take(120).collect();
+            Error::Parse {
+                path: path.to_string(),
+                message: self.redact(&format!("non-JSON response body (status {status}): {preview}")),
             }
         })?;
         if let Some(false) = parsed.get("success").and_then(Value::as_bool) {
@@ -501,6 +600,321 @@ pub fn logs_recent(client: &Client, sel: &LogsRecentSelector) -> Result<Value, E
     }))
 }
 
+
+// ---------------------------------------------------------------------------
+// Write primitives (Phase 1-3)
+// ---------------------------------------------------------------------------
+
+/// Selector for `channels create`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ChannelsCreateSelector {
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    /// API key (will be redacted in output).
+    pub key: Option<String>,
+    pub models: Option<String>,
+    pub group: Option<String>,
+    pub r#type: Option<i32>,
+    pub priority: Option<i32>,
+    pub weight: Option<i32>,
+}
+
+/// Selector for `channels update`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ChannelsUpdateSelector {
+    pub id: Option<u64>,
+    /// Fields to update, as a JSON object.
+    pub fields: Option<Value>,
+}
+
+/// Selector for `channels status`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ChannelsStatusSelector {
+    pub id: Option<u64>,
+    /// New status: 1=enabled, 2=disabled, 3=auto-disabled.
+    pub status: Option<i32>,
+}
+
+/// Selector for `channels test`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ChannelsTestSelector {
+    pub id: Option<u64>,
+    pub model: Option<String>,
+}
+
+/// Selector for `options list`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OptionsListSelector {
+    pub key: Option<String>,
+}
+
+/// Selector for `options set`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OptionsSetSelector {
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
+/// Selector for `tokens create`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TokensCreateSelector {
+    pub name: Option<String>,
+    pub remain_quota: Option<i64>,
+    pub unlimited_quota: Option<bool>,
+    pub expired_time: Option<i64>,
+    pub group: Option<String>,
+}
+
+/// Selector for `tokens update`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TokensUpdateSelector {
+    pub id: Option<u64>,
+    pub fields: Option<Value>,
+}
+
+/// Selector for `tokens key`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TokensKeySelector {
+    pub id: Option<u64>,
+}
+
+/// Selector for `logs stats`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LogsStatsSelector {}
+
+/// Selector for `models list`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelsListSelector {}
+
+/// `channels create`: POST /api/channel/ with channel definition.
+pub fn channels_create(client: &Client, sel: &ChannelsCreateSelector) -> Result<Value, Error> {
+    let name = sel.name.as_ref().ok_or_else(|| Error::Selector("channels.create requires `name`".into()))?;
+    let mut payload = json!({
+        "name": name,
+        "base_url": sel.base_url,
+        "key": sel.key,
+        "models": sel.models,
+        "group": sel.group,
+        "type": sel.r#type,
+        "priority": sel.priority,
+        "weight": sel.weight,
+    });
+    // Remove null fields — NewAPI rejects some nulls.
+    if let Some(obj) = payload.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
+    let result = client.post("/api/channel/", Some(&payload))?;
+    let data = data_object(&result);
+    Ok(json!({
+        "created": true,
+        "channel": redact_channel(data),
+    }))
+}
+
+/// `channels update`: PUT /api/channel/ with id + fields (PATCH semantics).
+pub fn channels_update(client: &Client, sel: &ChannelsUpdateSelector) -> Result<Value, Error> {
+    let id = sel.id.ok_or_else(|| Error::Selector("channels.update requires `id`".into()))?;
+    let fields = sel.fields.as_ref().ok_or_else(|| Error::Selector("channels.update requires `fields` (JSON object)".into()))?;
+    let mut payload = fields.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("id".to_string(), json!(id));
+        // NewAPI rejects status in PUT body; use channels status instead.
+        obj.remove("status");
+    }
+    client.put("/api/channel/", &payload)?;
+    // Re-read the channel to show the result.
+    let after = client.get(&format!("/api/channel/{id}"), &[])?;
+    let channel = data_object(&after);
+    Ok(json!({
+        "updated": true,
+        "after": redact_channel(channel),
+    }))
+}
+
+/// `channels status`: POST /api/channel/{id}/status.
+pub fn channels_status(client: &Client, sel: &ChannelsStatusSelector) -> Result<Value, Error> {
+    let id = sel.id.ok_or_else(|| Error::Selector("channels.status requires `id`".into()))?;
+    let status = sel.status.ok_or_else(|| Error::Selector("channels.status requires `status` (1=enabled, 2=disabled, 3=auto)".into()))?;
+    let path = format!("/api/channel/{id}/status");
+    let body = json!({"status": status});
+    client.post(&path, Some(&body))?;
+    Ok(json!({
+        "id": id,
+        "status": status,
+        "applied": true,
+    }))
+}
+
+/// `channels test`: GET /api/channel/test/{id}?model=...
+pub fn channels_test(client: &Client, sel: &ChannelsTestSelector) -> Result<Value, Error> {
+    let id = sel.id.ok_or_else(|| Error::Selector("channels.test requires `id`".into()))?;
+    let path = format!("/api/channel/test/{id}");
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(m) = &sel.model {
+        query.push(("model", m.clone()));
+    }
+    let data = client.get(&path, &query)?;
+    Ok(json!({
+        "id": id,
+        "success": data.get("success"),
+        "time": data.get("time"),
+        "message": data.get("message"),
+    }))
+}
+
+/// `options list`: GET /api/option/.
+pub fn options_list(client: &Client, sel: &OptionsListSelector) -> Result<Value, Error> {
+    let data = client.get("/api/option/", &[])?;
+    let items = data.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    let filtered: Vec<Value> = if let Some(key) = &sel.key {
+        items.iter().filter(|item| item.get("key").and_then(Value::as_str) == Some(key.as_str())).cloned().collect()
+    } else {
+        items
+    };
+    Ok(json!({
+        "total": filtered.len(),
+        "items": filtered,
+    }))
+}
+
+/// `options set`: PUT /api/option/ with {key, value}.
+pub fn options_set(client: &Client, sel: &OptionsSetSelector) -> Result<Value, Error> {
+    let key = sel.key.as_ref().ok_or_else(|| Error::Selector("options.set requires `key`".into()))?;
+    let value = sel.value.as_ref().ok_or_else(|| Error::Selector("options.set requires `value`".into()))?;
+    let body = json!({"key": key, "value": value});
+    client.put("/api/option/", &body)?;
+    Ok(json!({
+        "key": key,
+        "value": value,
+        "applied": true,
+    }))
+}
+
+/// `tokens create`: POST /api/token/.
+pub fn tokens_create(client: &Client, sel: &TokensCreateSelector) -> Result<Value, Error> {
+    let name = sel.name.as_ref().ok_or_else(|| Error::Selector("tokens.create requires `name`".into()))?;
+    let mut payload = json!({
+        "name": name,
+        "remain_quota": sel.remain_quota,
+        "unlimited_quota": sel.unlimited_quota,
+        "expired_time": sel.expired_time,
+        "group": sel.group,
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
+    let result = client.post("/api/token/", Some(&payload))?;
+    let data = data_object(&result);
+    Ok(json!({
+        "created": true,
+        "token": redact_token(data),
+    }))
+}
+
+/// `tokens update`: PUT /api/token/ with id + fields.
+pub fn tokens_update(client: &Client, sel: &TokensUpdateSelector) -> Result<Value, Error> {
+    let id = sel.id.ok_or_else(|| Error::Selector("tokens.update requires `id`".into()))?;
+    let fields = sel.fields.as_ref().ok_or_else(|| Error::Selector("tokens.update requires `fields` (JSON object)".into()))?;
+    let mut payload = fields.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("id".to_string(), json!(id));
+    }
+    client.put("/api/token/", &payload)?;
+    let after = client.get(&format!("/api/token/{id}"), &[])?;
+    let token = data_object(&after);
+    Ok(json!({
+        "updated": true,
+        "after": redact_token(token),
+    }))
+}
+
+/// `tokens key`: POST /api/token/{id}/key — regenerate and return raw key.
+pub fn tokens_key(client: &Client, sel: &TokensKeySelector) -> Result<Value, Error> {
+    let id = sel.id.ok_or_else(|| Error::Selector("tokens.key requires `id`".into()))?;
+    let path = format!("/api/token/{id}/key");
+    let result = client.post(&path, None)?;
+    let key = result.get("data").and_then(|d| d.get("key")).and_then(Value::as_str).unwrap_or("");
+    Ok(json!({
+        "id": id,
+        "key": key,
+        "note": "raw key returned; store in Sigil immediately",
+    }))
+}
+
+/// `logs stats`: GET /api/log/stat.
+pub fn logs_stats(client: &Client, _sel: &LogsStatsSelector) -> Result<Value, Error> {
+    let data = client.get("/api/log/stat", &[])?;
+    Ok(data_object(&data).clone())
+}
+
+/// `models list`: GET /v1/models using caller token (not admin).
+/// `models list`: GET /v1/models using caller token (not admin).
+///
+/// The caller token resolves from `RELAY_GATE_CALLER_TOKEN` env var.
+/// This is a separate credential from the admin token because /v1/models
+/// is the caller API, not the admin API.
+pub fn models_list(_client: &Client, _sel: &ModelsListSelector) -> Result<Value, Error> {
+    let caller_token = std::env::var("RELAY_GATE_CALLER_TOKEN")
+        .map_err(|_| Error::Credential(
+            "caller token not set; export RELAY_GATE_CALLER_TOKEN (use sigil binding L1UYUN_NEWAPI_API_KEY)"
+                .into(),
+        ))?;
+    let base_url = _client.base_url();
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let http = reqwest::blocking::Client::builder()
+        .connect_timeout(DEFAULT_REQUEST_TIMEOUT)
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| Error::Credential(format!("http client build failed: {e}")))?;
+    let resp = http
+        .get(&url)
+        .header("Authorization", &caller_token)
+        .send()
+        .map_err(|e| Error::Http {
+            status: 0,
+            path: "/v1/models".into(),
+            message: format!("transport: {e}"),
+        })?;
+    let status = resp.status().as_u16();
+    let text = resp.text().map_err(|e| Error::Http {
+        status,
+        path: "/v1/models".into(),
+        message: format!("response body unreadable: {e}"),
+    })?;
+    if status >= 400 {
+        return Err(Error::Http {
+            status,
+            path: "/v1/models".into(),
+            message: text,
+        });
+    }
+    let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+        let preview: String = text.chars().take(120).collect();
+        Error::Parse {
+            path: "/v1/models".into(),
+            message: format!("non-JSON response body (status {status}): {preview}"),
+        }
+    })?;
+    let models = parsed.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    let ids: Vec<String> = models.iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+        .collect();
+    Ok(json!({
+        "total": ids.len(),
+        "models": ids,
+    }))
+}
 fn pick_str(value: &Value, key: &str) -> Value {
     value.get(key).cloned().unwrap_or(Value::Null)
 }
