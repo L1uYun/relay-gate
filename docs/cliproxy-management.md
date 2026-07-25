@@ -1,5 +1,7 @@
 # CLIProxyAPI (CPA) Management
 
+> **2026-07-26 事实**：CPA 管理面当前由 `D:\AgentWork\tools\relay-gate\scripts\cliproxy_mgmt.py` 承载，**不是** Rust `relay-gate` 子命令。下文若写 `relay-gate cliproxy ...`，按该 Python 管理脚本理解，直到另开 CPA 原子 CLI contract。
+
 Owner: `D:\AgentWork\tools\relay-gate`
 Live instance: `xiaolab-japan` docker `cli-proxy-api` (`eceasy/cli-proxy-api:v7.2.91`)
 Bind: host `127.0.0.1:8317` only (not public)

@@ -1,17 +1,16 @@
-# relay-gate (Rust read-only core)
+# relay-gate (Rust atomic CLI)
 
 Agent-native Rust CLI for the NewAPI gateway at `https://newapi.l1uyun.top:8080`.
-This slice is strictly **read-only**: every HTTP operation is `GET`. Mutating
-NewAPI commands are out of scope and will require a separately reviewed write
-boundary.
+
+Canonical binary: `D:\AgentWork\state\relay-gate\bin\relay-gate.exe` (also on `PATH` via cargo bin).
+
+As of 2026-07-26 this CLI is **not read-only**. `schema` reports `mutation_allowed: true` and 18 atomic operations. Composite workflows (catalog projection, maintain/optimize, CPA management) stay outside this binary.
+
+Legacy Python CLI is archived at `D:\AgentWork\_archive\tools-relay-gate-python\`.
 
 ## Why
 
-The Python `relay-gate` CLI is being replaced incrementally with Rust. This
-crate establishes the read-only core: a stable versioned JSON envelope,
-structured selector input, a discoverable schema, classified errors, and
-redacted diagnostics. The existing Python files remain as compatibility
-reference during this slice.
+Replace the Python `relay-gate` surface with a stable Rust core: versioned JSON envelope, structured `--input` selectors, discoverable schema, classified errors, and redacted diagnostics. Higher-level maintain/catalog/CPA logic is composed from these primitives in scripts/workflows.
 
 ## Build
 
@@ -44,39 +43,74 @@ Errors use the same envelope with `ok: false` and a redacted `error` object.
 | `doctor` | `doctor` | none |
 | `channels list` | `channels.list` | `{"page":u32?,"page_size":u32?,"status":i32?,"type":i32?,"group":str?,"id_sort":bool?}` |
 | `channels get` | `channels.get` | `{"id":u64}` |
+| `channels create` | `channels.create` | `{"name":str,"type":i32?,"base_url":str?,"key":str?,"models":str?,"group":str?,"priority":i32?,"weight":i32?}` |
+| `channels update` | `channels.update` | `{"id":u64,"fields":{...}}` PATCH semantics; do not put `status` here |
+| `channels status` | `channels.status` | `{"id":u64,"status":i32}` 1=enabled, 2=disabled, 3=auto |
+| `channels test` | `channels.test` | `{"id":u64,"model":str?}` |
 | `tokens list` | `tokens.list` | `{"keyword":str?,"page":u32?,"page_size":u32?}` |
 | `tokens get` | `tokens.get` | `{"id":u64}` |
+| `tokens create` | `tokens.create` | `{"name":str,"group":str?,"remain_quota":i64?,"unlimited_quota":bool?,"expired_time":i64?}` |
+| `tokens update` | `tokens.update` | `{"id":u64,"fields":{...}}` |
+| `tokens key` | `tokens.key` | `{"id":u64}` regenerate key |
 | `logs recent` | `logs.recent` | `{"page":u32?,"page_size":u32?,"self":bool?}` |
+| `logs stats` | `logs.stats` | none |
+| `options list` | `options.list` | `{"key":str?}` |
+| `options set` | `options.set` | `{"key":str,"value":str}` |
+| `models list` | `models.list` | none; uses caller token |
 
 ```sh
 relay-gate schema
 relay-gate doctor
 relay-gate channels list --input '{"page":1,"page_size":10}'
 relay-gate channels get --input '{"id":7}'
+relay-gate channels status --input '{"id":7,"status":1}'
+relay-gate channels test --input '{"id":7,"model":"gpt-5.5"}'
 relay-gate tokens list --input '{"keyword":"codex"}'
+relay-gate options list
 relay-gate logs recent --input '{"page_size":20}'
+relay-gate logs stats
+# models list needs RELAY_GATE_CALLER_TOKEN
+sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate --output json models list
 ```
 
 ## Credentials
 
-The admin token resolves from the environment, in order:
+Admin token resolves from the environment, in order:
 
-1. `SIGIL_ADMIN_TOKEN` (existing Sigil environment path)
-2. `RELAY_GATE_ADMIN_TOKEN` (process env fallback)
+1. `SIGIL_ADMIN_TOKEN`
+2. `RELAY_GATE_ADMIN_TOKEN`
 
-It is sent as a raw `Authorization` header plus `New-Api-User: 1`. Override the
-base URL with `--base-url` or `RELAY_GATE_BASE_URL`; override the user id with
-`RELAY_GATE_USER_ID`.
+Sent as raw `Authorization` plus `New-Api-User: 1` (override with `RELAY_GATE_USER_ID`). Base URL: `--base-url` or `RELAY_GATE_BASE_URL`.
+
+Caller token for `models list`:
+
+1. `RELAY_GATE_CALLER_TOKEN`
+
+Prefer `sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate ...` so secrets stay out of shell history.
+
+## Write semantics
+
+- Write ops currently execute immediately. There is no Rust `--dry-run/--apply` flag yet.
+- `channels.update` is PATCH-style: send only fields to change; never include `status` (use `channels.status`).
+- Always `channels get` first when patching a live channel so user edits are not overwritten.
+
+## Not in this binary
+
+| Capability | Owner |
+|---|---|
+| Codex/Codex++/Pi/CodeBuddy catalog projection | `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` |
+| CodeBuddy sync helper | `scripts/sync-codebuddy-models.ps1` |
+| CPA / cliproxy management | `scripts/cliproxy_mgmt.py` + `docs/cliproxy-management.md` |
+| Remote maintain timer | `xiaolab-japan:/opt/newapi-maintainer` (Python, remote-only) |
+| `channels maintain/optimize`, `codex-catalog *`, `agent-models *` | retired composite CLI surface |
 
 ## Redaction
 
 The raw credential is never echoed in stdout, arguments, or diagnostics:
 
 - Channel/token `key` fields are masked to `{present, sha256, redacted}`.
-- Non-2xx and `success:false` bodies are redacted before being placed in error
-  messages.
-- A final scrub replaces any remaining occurrence of the raw token in the
-  serialized envelope with `[REDACTED]`.
+- Non-2xx and `success:false` bodies are redacted before being placed in error messages.
+- A final scrub replaces any remaining occurrence of the raw token in the serialized envelope with `[REDACTED]`.
 
 ## Output modes
 
@@ -85,10 +119,9 @@ The raw credential is never echoed in stdout, arguments, or diagnostics:
 - `--output quiet`: no stdout; exit code `0` on success, `1` on error.
 - `--pretty`: pretty-print JSON.
 
-## Catalog
+## Catalog overrides
 
-`grok-4.5` is pinned to a `200000` Codex product context window. See
-`src/catalog.rs`.
+`grok-4.5` and other context-window pins live in `src/catalog.rs` for local projection consumers.
 
 ## Testing
 
@@ -97,10 +130,6 @@ CARGO_HOME=D:/AgentWork/state/cargo/home \
 CARGO_TARGET_DIR=D:/AgentWork/state/cargo/targets/relay-gate-rust-305 \
 cargo test
 ```
-
-The integration suite (`tests/cli.rs`) runs an in-process fixture HTTP server
-that proves auth headers, GET-only semantics, non-2xx JSON errors, `success:
-false` handling, redaction, and the `grok-4.5` -> `200000` anchor.
 
 ## License
 

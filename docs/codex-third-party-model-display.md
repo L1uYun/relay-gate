@@ -4,7 +4,7 @@
 
 Codex 桌面端菜单显示第三方模型（glm-5.2、claude-opus-4-8、deepseek-v4-pro、grok-4.3、kimi-for-coding 等）由 **Codex++（codex-plus-plus）的运行时 CDP 注入** 控制，不是 cc-switch，不是 `config.toml` 的 `model_catalog_json` 指令，也不是本地 watcher 脚本直接改前端。
 
-2026-07-10 起，本机目录改为**集合 + 简化规格 + 完整模板**三层合成：NewAPI `/v1/models` 决定当前模型集合；cc-switch 当前 provider 的 `settings_config.modelCatalog.models` 若存在，只提供 `model`、`displayName`、`contextWindow` 等简化规格；现有本地完整 catalog 提供 Codex schema 模板。`relay-gate codex-catalog sync` 按 cc-switch 的生成方式克隆模板、覆盖规格并为上游新增模型自动补齐完整条目，再投影到 `~/.codex/cc-switch-model-catalog.json`、`~/.codex/models_cache.json` 和 Codex++ `settings.json relayProfiles[].modelList`。
+2026-07-10 起，本机目录改为**集合 + 简化规格 + 完整模板**三层合成：NewAPI `/v1/models` 决定当前模型集合；cc-switch 当前 provider 的 `settings_config.modelCatalog.models` 若存在，只提供 `model`、`displayName`、`contextWindow` 等简化规格；现有本地完整 catalog 提供 Codex schema 模板。本地目录投影由组合层脚本完成：先用 `relay-gate models list` 读 NewAPI `/v1/models` 集合，再由 `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` 克隆完整 Codex schema 模板、覆盖规格并为上游新增模型补齐条目，投影到 `~/.codex/cc-switch-model-catalog.json`、`~/.codex/models_cache.json` 和 Codex++ `settings.json relayProfiles[].modelList`。旧 `relay-gate codex-catalog sync` 子命令已不在 Rust CLI。
 
 cc-switch、config.toml、catalog 文件本身仍然不碰前端 UI 的 Statsig 配置；前端显示仍然靠 Codex++ 的 CDP 注入。区别只是：Codex++ 注入前消费的本地模型清单和目录元数据现在由 relay-gate CLI 统一生成，Windows 计划任务也直接执行 CLI，不再常驻 PowerShell watcher。
 
@@ -59,9 +59,9 @@ cc-switch（`D:\software\cc-switch\cc-switch.exe`）是配置切换器，数据�
 
 cc-switch 切换 provider 时把这三份写进 `~/.codex/` 的三个文件。**不碰 Codex 前端的 Statsig 配置**，所以菜单不显示第三方模型。
 
-### 4. relay-gate CLI 是本地目录 owner
+### 4. 本地目录 owner：Rust `models list` + 组合层 PS1
 
-2026-07-10 起，`relay-gate codex-catalog sync` 直接负责本地模型目录合成，不再由 `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` 常驻监听：
+2026-07-26 事实：Rust CLI 只提供 `models list` 原子原语；本地模型目录合成由 `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` 负责（内部调用 `models list`）：
 
 1. 从 NewAPI `/v1/models` 读取当前暴露模型 id。
 2. 可选读取 cc-switch 当前 provider 的简化 `modelCatalog` 规格；没有规格时复用现有完整 catalog 模板。
@@ -71,15 +71,15 @@ cc-switch 切换 provider 时把这三份写进 `~/.codex/` 的三个文件。**
 6. servitor 的 Claude/Codex provider 动态读取 NewAPI 模型，并使用 catalog `visibility=hide` 排除本地隔离项。
 7. servitor 的 `agy-tui` 不属于 Relay Gate 投影目标：当前 AGY 原生配置没有第三方 provider/model 注入规范，且 servitor 通过 TUI 模式运行、未传递 `--model`。其静态 Gemini 列表是 AGY 自身能力，不伪装成 NewAPI 同步结果。
 
-`CodexModelMenuCacheWatcher` 计划任务现在每 5 分钟直接执行：
+推荐的计划任务 / 手动修复命令：
 
 ```powershell
-relay-gate --output json codex-catalog sync --apply --log-path "$env:LOCALAPPDATA\RelayGate\codex-catalog-sync.json"
+pwsh -File D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1 -Once
 ```
 
-任务 action 已从 `wscript -> launch-codex-model-menu-cache-watcher.vbs -> pwsh -Watch` 改为 `pythonw.exe -> relay_gate.py`。`pythonw.exe` 无控制台窗口；成功与失败都通过任务退出码和 `%LOCALAPPDATA%\RelayGate\codex-catalog-sync.json` 观察，不弹黑窗口。这一条任务同时维护 Codex、Codex++、Pi、CodeBuddy、WorkBuddy 和 servitor 动态发现面，不再需要单独的 agent 模型同步任务。旧 VBS/PowerShell watcher 保留为兼容/诊断脚本，但不再拥有自动同步生命周期；失效的 Statsig/LevelDB patch 也不再位于计划任务关键路径。旧的禁用任务 `CodexCatalogSync` 已删除，避免被误认成第二个同步 owner。
+Python `relay_gate.py` 本地 CLI 已归档到 `D:\AgentWork\_archive\tools-relay-gate-python\`。自动同步若仍依赖计划任务，应改为调用 `refresh-codex-model-menu-cache.ps1 -Once`（上游集合源 = `relay-gate models list`）。旧 `codex-catalog task install` 不在 Rust CLI。
 
-计划任务损坏或被删除时，使用同一个 CLI 重新安装：`relay-gate --output json codex-catalog task install --interval-minutes 5 --apply`。这也是计划任务层的一命令回滚/重建入口。
+计划任务损坏或被删除时，重建 Windows 计划任务直接指向 `pwsh -File D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1 -Once`，不要调用已退役的 `codex-catalog task`。
 
 ### 5. 本次补齐的模型元数据
 
@@ -108,7 +108,8 @@ Codex++ 日志（`C:\Users\84618\.codex-session-delete\codex-plus.log`）持续�
 | config.toml + model_catalog_json | `base_url`、`wire_api`、`model` 负责请求路由；`model_catalog_json` 只负责让 Codex 加载自定义模型元数据 | 否 |
 | cc-switch-model-catalog.json | 本地完整 Codex schema；由现有完整模板克隆，并用 cc-switch 简化规格和 NewAPI 模型集合覆盖 | 否 |
 | models_cache.json | 本地缓存投影，现与 `cc-switch-model-catalog.json` 保持同源 | 否 |
-| relay-gate CLI | 自动目录生成器：NewAPI model ids + cc-switch optional specs + local full template -> catalog/models_cache/settings | 否 |
+| relay-gate Rust CLI | 原子面：`models list` 等 NewAPI 操作 | 否 |
+| refresh-codex-model-menu-cache.ps1 | 组合目录生成器：NewAPI model ids + cc-switch optional specs + local full template -> catalog/models_cache/settings | 否 |
 
 ## 给别人电脑配置的步骤
 
@@ -134,27 +135,28 @@ config.toml/catalog/auth 三个文件 Codex++ 会自动写进 `~/.codex/`（和 
 - Codex catalog：`C:\Users\84618\.codex\cc-switch-model-catalog.json`
 - Codex auth：`C:\Users\84618\.codex\auth.json`
 - Codex models_cache：`C:\Users\84618\.codex\models_cache.json`
-- relay-gate CLI：`D:\Python3.11.1\Scripts\relay-gate.exe`（editable source：`D:\AgentWork\tools\relay-gate\scripts\relay_gate.py`）
-- 自动同步命令：`relay-gate --output json codex-catalog sync --apply`
-- 计划任务：`CodexModelMenuCacheWatcher`（每 5 分钟由 `pythonw.exe` 无窗口执行 editable `relay_gate.py`）
-- 同步结果：`%LOCALAPPDATA%\RelayGate\codex-catalog-sync.json`
+- relay-gate CLI：`D:\AgentWork\state\relay-gate\bin\relay-gate.exe`（源码 `D:\AgentWork\tools\relay-gate\`，Rust）
+- 上游模型集合：`sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate --output json models list`
+- 本地目录投影：`pwsh -File D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1 -Once`
+- CodeBuddy 单独投影：`D:\AgentWork\tools\relay-gate\scripts\sync-codebuddy-models.ps1`
+- 计划任务建议 action：上述 PS1 `-Once`（旧 pythonw/relay_gate.py / codex-catalog task 已退役）
+- 同步状态目录：`%LOCALAPPDATA%\CodexModelMenuCacheWatcher\` / `%LOCALAPPDATA%\RelayGate\`
 - Pi NewAPI 模型：`C:\Users\84618\.pi\agent\models.json`
 - CodeBuddy 第三方模型：`C:\Users\84618\.codebuddy\models.json`
 - WorkBuddy 第三方模型：`C:\Users\84618\.workbuddy\models.json`
-- 子代理手动同步：`relay-gate --output json agent-models sync --apply`
-- 旧 watcher 脚本：`D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1`（仅兼容/诊断，不再由计划任务调用）
+- 归档 Python CLI：`D:\AgentWork\_archive\tools-relay-gate-python\`
 
 ## 验证方法
 
 先跑 relay-gate 单元测试和 dry-run：
 
 ```powershell
-python -m unittest discover -s D:\AgentWork\tools\relay-gate\tests -p "test_*.py"
-relay-gate --output json codex-catalog sync --dry-run
-relay-gate --output json codex-catalog task status
+cargo test --manifest-path D:\AgentWork\tools\relay-gate\Cargo.toml
+sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate --output json models list
+pwsh -File D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1 -Once -DryRun
 ```
 
-测试覆盖：cc-switch 简化 `modelCatalog` 规格展开、上游只有 id 时的完整模板合成、模型上下文/推理覆盖、Codex++ active profile 投影、Pi/CodeBuddy/WorkBuddy 适配投影、幂等写入、结构化失败日志，以及计划任务必须通过 `pythonw.exe` 无窗口调用 editable `relay_gate.py`。实际应用后，`written=false` 表示目录已经一致，不会每 5 分钟重复改写文件。
+验证覆盖：Rust `cargo test` 覆盖 envelope/redact/catalog anchors；组合层 PS1 负责模板合成与多消费者投影。实际应用后应确认 catalog/models_cache 与 `models list` 集合一致，且内容无变时不重复写盘。
 
 改动 `config.toml`、`model_catalog_json`、cc-switch 当前 provider 或 relay-gate catalog 逻辑后，再跑：
 
@@ -197,3 +199,4 @@ ws.close()
 
 如果 `available_models` 含第三方模型且 `codexPlusMarks` 非空，说明 Codex++ 注入生效。
 如果 `available_models` 只有官方 5 个且 `codexPlusMarks` 为空，说明只有 cc-switch/手动配置，菜单不会显示第三方模型。
+

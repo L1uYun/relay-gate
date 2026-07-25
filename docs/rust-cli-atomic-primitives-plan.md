@@ -1,86 +1,83 @@
 # relay-gate Rust CLI — 原子写原语扩展计划
 
-> 2026-07-25. Python legacy CLI 已归档到 `D:\AgentWork\_archive\tools-relay-gate-python\`。
-> Rust 二进制 v0.1.0 是 canonical，当前 read-only。本计划评估哪些写操作值得做成 Rust 原子原语，
-> 哪些通过原语拼接或直接走原生 NewAPI API。
+> 更新 2026-07-26。Python legacy CLI 已归档到 `D:\AgentWork\_archive\tools-relay-gate-python\`。
+> Rust 二进制是 canonical。**Phase 1–3 已落地**：`mutation_allowed=true`，18 个原子操作。
+> 本文件保留设计原则与“不进 Rust 的组合层”边界；不再描述“当前 read-only”。
 
-## 现状
+## 现状（事实）
 
-Rust CLI 已有：`doctor`、`channels list/get`、`tokens list/get`、`logs recent`、`schema`。
+Rust CLI 已有：
 
-`Client` 结构体只有 `get()` 方法（HTTP GET）。没有 `post()` / `put()`。
+- meta: `schema` `doctor`
+- channels: `list` `get` `create` `update` `status` `test`
+- tokens: `list` `get` `create` `update` `key`
+- logs: `recent` `stats`
+- options: `list` `set`
+- models: `list`（caller token 路径，`Client::new_caller()`）
 
-redact 模块（`redact.rs`）已成熟，支持 secret 文本脱敏和字段级 sha256 指纹。
+`Client` 已有 `get()` / `post()` / `put()` / `send_and_parse()` / `new_caller()`。
+
+选择器统一 `--input JSON`。写操作当前直接执行；**`--dry-run/--apply` 尚未实现**（计划原则保留，待补）。
+
+redact 模块成熟，POST/PUT response 同样过 redact。
 
 ## 设计原则
 
 1. **只添加原子原语**：每个新增命令对应一个 NewAPI API endpoint 的一种 HTTP method，不做组合逻辑。
-2. **高层操作走拼接**：`channels maintain`（一轮维护）、`channels optimize`（优先级优化）、`codex-catalog sync`（多消费者目录同步）等复合操作不进 Rust，由 workflow 或 shell 脚本调用原子原语拼接。
-3. **dry-run 是一等公民**：每个写原语默认 dry-run，`--apply` 才落地。
-4. **secret 不泄露**：复用现有 redact 模块，POST/PUT 的 response 同样过 redact。
+2. **高层操作走拼接**：`channels maintain`、`channels optimize`、catalog 投影等复合操作不进 Rust，由 workflow / shell 调用原子原语拼接。
+3. **dry-run 是目标一等公民**：计划要求写原语默认 dry-run、`--apply` 才落地；**当前实现尚未补齐**，操作时先 get 再写。
+4. **secret 不泄露**：复用 redact 模块。
 
-## Phase 1：HTTP 写原语 + channel 状态管理（最小可用）
+## Phase 1–3（已完成）
 
-给 `Client` 加 `post()` 和 `put()` 方法（复用 `get()` 的 auth、timeout、redact 逻辑）。
+### Phase 1：channel 状态管理
 
-| 新增命令 | NewAPI API | 原子性 | 理由 |
-|---|---|---|---|
-| `channels create` | `POST /api/channel/` | 原子 | 单次 POST，body 是完整 channel 定义 |
-| `channels update` | `PUT /api/channel/` | 原子 | PATCH 语义，body 只含 id + 要改的字段 |
-| `channels status` | `POST /api/channel/{id}/status` | 原子 | 单字段操作，NewAPI 要求 status 走单独 endpoint |
-| `channels test` | `GET /api/channel/test/{id}` | 原子 | 只读 probe，但需要传 model 参数 |
+| 命令 | NewAPI API | 状态 |
+|---|---|---|
+| `channels create` | `POST /api/channel/` | done |
+| `channels update` | `PUT /api/channel/` | done |
+| `channels status` | `POST /api/channel/{id}/status` | done |
+| `channels test` | `GET /api/channel/test/{id}` | done |
 
-这 4 个解锁了 channel CRUD + 健康测试。`channels hold-quota`、`channels recover` 是这些原语的组合（读 channel → 改 status → 测试 → 改回），不进 Rust。
+### Phase 2：option 和 token
 
-## Phase 2：option 和 token 写原语
+| 命令 | NewAPI API | 状态 |
+|---|---|---|
+| `options list` | `GET /api/option/` | done |
+| `options set` | `PUT /api/option/` | done |
+| `tokens create` | `POST /api/token/` | done |
+| `tokens update` | `PUT /api/token/` | done |
+| `tokens key` | `POST /api/token/{id}/key` | done |
+| `logs stats` | `GET /api/log/stat` | done |
 
-| 新增命令 | NewAPI API | 原子性 | 理由 |
-|---|---|---|---|
-| `options list` | `GET /api/option/` | 原子 | 读 NewAPI 全局选项（AutomaticDisableKeywords 等） |
-| `options set` | `PUT /api/option/` | 原子 | 设单个 key=value，body 只含 key + value |
-| `tokens create` | `POST /api/token/` | 原子 | 单次 POST |
-| `tokens update` | `PUT /api/token/` | 原子 | PATCH 语义 |
-| `tokens key` | `POST /api/token/{id}/key` | 原子 | 重新生成 key，返回明文 key（需 Sigil 存储） |
-| `logs stats` | `GET /api/log/stat` | 原子 | 只读聚合统计 |
+### Phase 3：models 探查
 
-`tokens ensure-self` 是 `tokens create` + `tokens key` + Sigil 存储的组合，不进 Rust。
-
-## Phase 3：models 探查原语
-
-| 新增命令 | NewAPI API | 原子性 | 理由 |
-|---|---|---|---|
-| `models list` | `GET /v1/models`（caller API） | 原子 | 用 caller token 列出上游暴露的模型 |
-
-`codex-catalog sync` 是 `models list` + 读 channel → 写本地 catalog 文件 → 写 Pi/CodeBuddy 配置的组合，不进 Rust。`agent-models sync` 同理。
+| 命令 | NewAPI API | 状态 |
+|---|---|---|
+| `models list` | `GET /v1/models`（caller API） | done |
 
 ## 不进 Rust 的（保持组合层）
 
-| Python 命令 | 为什么不进 |
-|---|---|
-| `channels maintain` | 组合：读 options → 改 options → hold quota → test → recover → optimize → 写 Buddy 配置 |
-| `channels optimize` | 组合：读 logs → 计算优先级 → channels update × N |
-| `channels hold-quota` | 组合：读 channel → channels status → channels test |
-| `channels recover` | 组合：channels test → channels status |
-| `channels models set` | 等价于 `channels update` 传 models/test_model/model_mapping 字段 |
-| `responses-bridge ensure` | 组合：options list → 解析 JSON → options set |
-| `groups ensure` | 组合：groups list → 校验 → options set × 3 |
-| `tokens ensure-self` | 组合：tokens create → tokens key → Sigil 存储 |
-| `codex-catalog sync` | 组合：models list → 写多个本地文件 |
-| `codex-catalog task install/status/remove` | Windows 计划任务管理，非 NewAPI API |
-| `agent-models sync` | 组合：models list → 写 Pi/CodeBuddy 配置文件 |
+| 旧 Python 命令 | 为什么不进 | 当前 owner / 替代 |
+|---|---|---|
+| `channels maintain` | 组合逻辑 | remote maintainer on xiaolab-japan |
+| `channels optimize` | 组合：logs → priority → update × N | 手工 / 脚本拼接原子原语 |
+| `channels hold-quota` / `recover` | status + test 组合 | `channels status` + `channels test` |
+| `channels models set` | 等价 update 字段 | `channels update --input '{"id":N,"fields":{...}}'` |
+| `responses-bridge ensure` / `groups ensure` | options 组合 | `options list/set` |
+| `tokens ensure-self` | create + key + Sigil | 原子 tokens.* + sigil 手工 |
+| `codex-catalog sync/task` | 多文件投影 + Windows 任务 | `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` + `models list` |
+| `agent-models sync` | 多消费者投影 | 同上 / `scripts/sync-codebuddy-models.ps1` |
+| `cliproxy *` | CPA 管理面 | `scripts/cliproxy_mgmt.py` |
 
-## 实现顺序
+## 后续（未开）
 
-1. `Client::post()` + `Client::put()`（lib.rs，复用 get 的 auth/timeout/redact）
-2. `channels create` / `channels update` / `channels status`（Phase 1）
-3. `channels test`（Phase 1，GET 但需要 caller token 认证路径）
-4. `options list` / `options set`（Phase 2）
-5. `tokens create` / `tokens update` / `tokens key`（Phase 2）
-6. `logs stats`（Phase 2，纯只读）
-7. `models list`（Phase 3，caller API 认证路径）
+1. 给写原语补 dry-run / apply 边界（对齐原设计原则）。
+2. 组合层 catalog 投影继续以 `models list` 为上游集合源，不要把复合逻辑塞回 Rust。
+3. 评估是否给 CPA 做独立原子 CLI（另开 contract），当前不进 relay-gate 主二进制。
 
-## 每个 Phase 的验收
+## 验收记录
 
-- Phase 1：能用 Rust CLI 创建、更新、启停、测试一个 channel，不调用 Python 脚本或手写 curl。
-- Phase 2：能用 Rust CLI 管理 NewAPI 全局选项和 caller token 全生命周期。
-- Phase 3：能用 Rust CLI 列出上游模型集合，供 catalog sync 组合层消费。
+- Phase 1–3 代码：`c95c0dd` 一带入主线。
+- Live `relay-gate --output json schema`：`mutation_allowed=true`，18 ops。
+- 文档同步：2026-07-26（本回合）。
