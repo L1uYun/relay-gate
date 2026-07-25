@@ -424,7 +424,7 @@ class RoutingProposalTest(unittest.TestCase):
             "gpt-5.6-sol": (216000, "low", ["low", "medium", "high", "xhigh", "max", "ultra"]),
             "gpt-5.6-terra": (216000, "medium", ["low", "medium", "high", "xhigh", "max", "ultra"]),
             "gpt-5.6-luna": (216000, "medium", ["low", "medium", "high", "xhigh", "max"]),
-            "grok-4.5": (400000, "medium", ["low", "medium", "high", "xhigh"]),
+            "grok-4.5": (200000, "medium", ["low", "medium", "high", "xhigh"]),
             "grok-4.3": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
             "grok-3-mini": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),
             "grok-3-mini-fast": (1000000, "medium", ["none", "low", "medium", "high", "xhigh"]),

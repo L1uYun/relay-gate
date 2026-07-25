@@ -1,7 +1,7 @@
 # CLIProxyAPI (CPA) Management
 
 Owner: `D:\AgentWork\tools\relay-gate`
-Live instance: `xiaolab-japan` docker `cli-proxy-api` (`eceasy/cli-proxy-api:v7.2.73`)
+Live instance: `xiaolab-japan` docker `cli-proxy-api` (`eceasy/cli-proxy-api:v7.2.91`)
 Bind: host `127.0.0.1:8317` only (not public)
 Management secret: Sigil `cliproxy-mgmt-key` (config stores bcrypt under `remote-management.secret-key`)
 Caller API key for NewAPI upstream: Sigil `cliproxy-api-key` / `cpa-api-key`

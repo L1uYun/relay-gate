@@ -257,9 +257,8 @@ class ContextMeta:
     CODEX_PRODUCT_OVERRIDES: dict[str, int] = {
         "glm-5.2": 400_000,
         "workbuddy-glm-5.2": 400_000,
-        # Codex async compaction needs headroom under the 500k upstream hard limit.
-        # Without this, grok-4.5 triggers at ~475k and can grow past 500k before compact finishes.
-        "grok-4.5": 400_000,
+        # User override: Codex display/compaction trigger = 200k under 500k upstream limit.
+        "grok-4.5": 200_000,
         # OpenAI product context for GPT-5.6 family reverted to 272k (from 372k) to reduce over-billing.
         # Leave a small async-compaction cushion under the product limit.
         "gpt-5.6-sol": 216_000,  # 80% of 272k product limit for async compaction headroom
