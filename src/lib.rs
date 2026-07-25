@@ -289,9 +289,14 @@ impl Client {
                 message: self.redact(&text),
             });
         }
-        let parsed: Value = serde_json::from_str(&text).map_err(|_| Error::Parse {
-            path: path.to_string(),
-            message: "non-JSON response body".to_string(),
+        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+            let preview: String = text.chars().take(120).collect();
+            Error::Parse {
+                path: path.to_string(),
+                message: self.redact(&format!(
+                    "non-JSON response body (status {status}): {preview}"
+                )),
+            }
         })?;
         if let Some(false) = parsed.get("success").and_then(Value::as_bool) {
             let message = parsed
@@ -666,6 +671,46 @@ mod tests {
         let sel = TokensGetSelector::default();
         let err = tokens_get(&untargetable_client(), &sel).unwrap_err();
         assert!(matches!(err, Error::Selector(_)));
+    }
+
+
+    #[test]
+    fn non_json_2xx_message_includes_status_and_preview() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "<html>not-json SECRET-CANARY-XYZ</html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let client = Client::new(
+            format!("http://{addr}"),
+            "SECRET-CANARY-XYZ",
+            "1",
+        )
+        .unwrap();
+        let err = client.get("/api/status", &[]).unwrap_err();
+        match err {
+            Error::Parse { message, .. } => {
+                assert!(message.contains("non-JSON response body (status 200)"), "{message}");
+                assert!(message.contains("<html>"), "{message}");
+                assert!(!message.contains("SECRET-CANARY-XYZ"), "credential leaked: {message}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     /// A client pointed at a loopback that never answers; selector validation
