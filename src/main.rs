@@ -9,7 +9,7 @@ use relay_gate::{
     Client, Envelope, Error, LogsRecentSelector, LogsStatsSelector,
     ModelsListSelector, OptionsListSelector, OptionsSetSelector,
     TokensCreateSelector, TokensGetSelector, TokensKeySelector,
-    TokensListSelector, TokensUpdateSelector,
+    TokensListSelector, TokensUpdateSelector, WriteMode,
     schema,
 };
 use serde::de::DeserializeOwned;
@@ -31,6 +31,12 @@ struct Cli {
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pretty: bool,
+    /// Land mutation commands. Write ops default to dry-run without this flag.
+    #[arg(long, global = true, default_value_t = false)]
+    apply: bool,
+    /// Force dry-run preview. Wins over `--apply` when both are set.
+    #[arg(long, global = true, default_value_t = false)]
+    dry_run: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -203,7 +209,8 @@ fn run(cli: Cli) -> bool {
         Client::new_caller(base_url.unwrap_or(relay_gate::DEFAULT_BASE_URL)).unwrap()
     };
 
-    let result = execute(&cli.command, &client);
+    let write_mode = WriteMode::resolve(cli.apply, cli.dry_run);
+    let result = execute(&cli.command, &client, write_mode);
     let env = match result {
         Ok(data) => Envelope::ok(operation, data),
         Err(err) => Envelope::err(operation, err),
@@ -244,7 +251,7 @@ fn operation_name(cmd: &Command) -> &'static str {
     }
 }
 
-fn execute(cmd: &Command, client: &Client) -> Result<Value, Error> {
+fn execute(cmd: &Command, client: &Client, write_mode: WriteMode) -> Result<Value, Error> {
     match cmd {
         Command::Schema => Ok(schema::build()),
         Command::Doctor => relay_gate::doctor(client),
@@ -259,15 +266,15 @@ fn execute(cmd: &Command, client: &Client) -> Result<Value, Error> {
             }
             ChannelsAction::Create { input } => {
                 let sel: ChannelsCreateSelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::channels_create(client, &sel)
+                relay_gate::channels_create(client, &sel, write_mode)
             }
             ChannelsAction::Update { input } => {
                 let sel: ChannelsUpdateSelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::channels_update(client, &sel)
+                relay_gate::channels_update(client, &sel, write_mode)
             }
             ChannelsAction::Status { input } => {
                 let sel: ChannelsStatusSelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::channels_status(client, &sel)
+                relay_gate::channels_status(client, &sel, write_mode)
             }
             ChannelsAction::Test { input } => {
                 let sel: ChannelsTestSelector = parse_selector(Some(input.as_str()))?;
@@ -285,15 +292,15 @@ fn execute(cmd: &Command, client: &Client) -> Result<Value, Error> {
             }
             TokensAction::Create { input } => {
                 let sel: TokensCreateSelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::tokens_create(client, &sel)
+                relay_gate::tokens_create(client, &sel, write_mode)
             }
             TokensAction::Update { input } => {
                 let sel: TokensUpdateSelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::tokens_update(client, &sel)
+                relay_gate::tokens_update(client, &sel, write_mode)
             }
             TokensAction::Key { input } => {
                 let sel: TokensKeySelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::tokens_key(client, &sel)
+                relay_gate::tokens_key(client, &sel, write_mode)
             }
         },
         Command::Logs { action } => match action {
@@ -313,7 +320,7 @@ fn execute(cmd: &Command, client: &Client) -> Result<Value, Error> {
             }
             OptionsAction::Set { input } => {
                 let sel: OptionsSetSelector = parse_selector(Some(input.as_str()))?;
-                relay_gate::options_set(client, &sel)
+                relay_gate::options_set(client, &sel, write_mode)
             }
         },
         Command::Models { action } => match action {

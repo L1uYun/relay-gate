@@ -90,7 +90,10 @@ Prefer `sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate ...` so secrets
 
 ## Write semantics
 
-- Write ops currently execute immediately. There is no Rust `--dry-run/--apply` flag yet.
+- Global flags: --dry-run (force preview), --apply (land mutation).
+- Mutation ops: channels.create/update/status, 	okens.create/update/key, options.set.
+
+- Write ops **default to dry-run**. Pass --apply to land. If both --dry-run and --apply are set, dry-run wins.
 - `channels.update` is PATCH-style: send only fields to change; never include `status` (use `channels.status`).
 - Always `channels get` first when patching a live channel so user edits are not overwritten.
 
@@ -134,3 +137,4 @@ cargo test
 ## License
 
 MIT
+

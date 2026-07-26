@@ -1,13 +1,13 @@
-//! Relay Gate read-only core.
+//! Relay Gate atomic CLI core.
 //!
 //! Agent-native Rust surface for the NewAPI gateway at
-//! `https://newapi.l1uyun.top:8080`. This slice is strictly read-only: every
-//! HTTP operation is GET. Admin authentication resolves from the
-//! `SIGIL_ADMIN_TOKEN` environment variable (falling back to
-//! `RELAY_GATE_ADMIN_TOKEN`) and is sent as a raw `Authorization` header plus a
-//! `New-Api-User` header. The token is never echoed in stdout, arguments, or
-//! diagnostics; a final redaction pass scrubs any occurrence of the raw
-//! credential from the serialized JSON envelope.
+//! `https://newapi.l1uyun.top:8080`. Read primitives use GET; write primitives
+//! are atomic POST/PUT operations that default to dry-run unless `--apply` is
+//! set. Admin authentication resolves from the `SIGIL_ADMIN_TOKEN` environment
+//! variable (falling back to `RELAY_GATE_ADMIN_TOKEN`) and is sent as a raw
+//! `Authorization` header plus a `New-Api-User` header. The token is never
+//! echoed in stdout, arguments, or diagnostics; a final redaction pass scrubs
+//! any occurrence of the raw credential from the serialized JSON envelope.
 //!
 //! All commands emit a versioned JSON envelope by default:
 //!
@@ -49,7 +49,66 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// JSON envelope schema version emitted by every command.
 pub const SCHEMA_VERSION: &str = "relay-gate.v1";
 
-/// Error type for the read-only core.
+/// Write intent for mutation primitives.
+///
+/// Default is [`WriteMode::DryRun`]. Pass `--apply` at the CLI to land a write.
+/// If both `--dry-run` and `--apply` are present, dry-run wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Preview only; no POST/PUT is issued.
+    DryRun,
+    /// Land the mutation.
+    Apply,
+}
+
+impl WriteMode {
+    /// Resolve CLI flags. `--dry-run` wins over `--apply`; bare invocations dry-run.
+    pub fn resolve(apply: bool, dry_run: bool) -> Self {
+        if dry_run || !apply {
+            Self::DryRun
+        } else {
+            Self::Apply
+        }
+    }
+
+    pub fn is_apply(self) -> bool {
+        matches!(self, Self::Apply)
+    }
+}
+
+fn dry_run_preview(method: &str, path: &str, body: Value) -> Value {
+    json!({
+        "dry_run": true,
+        "applied": false,
+        "method": method,
+        "path": path,
+        "body": body,
+        "note": "pass --apply to land; --dry-run wins over --apply",
+    })
+}
+
+fn redact_body_secrets(mut body: Value) -> Value {
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(key) = obj.get("key").cloned() {
+            if let Some(s) = key.as_str() {
+                if !s.is_empty() {
+                    obj.insert(
+                        "key".into(),
+                        json!({
+                            "present": true,
+                            "sha256": secret_fingerprint(s),
+                            "redacted": true,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    body
+}
+
+
+/// Error type for the atomic CLI core.
 ///
 /// Messages are constructed with the raw credential already redacted so that
 /// [`Error`]`::Display` output is safe to surface in diagnostics.
@@ -165,7 +224,7 @@ impl Envelope {
     }
 }
 
-/// HTTP client for the NewAPI admin API. GET-only.
+/// HTTP client for the NewAPI admin API.
 #[derive(Clone)]
 pub struct Client {
     base_url: String,
@@ -698,8 +757,15 @@ pub struct LogsStatsSelector {}
 pub struct ModelsListSelector {}
 
 /// `channels create`: POST /api/channel/ with channel definition.
-pub fn channels_create(client: &Client, sel: &ChannelsCreateSelector) -> Result<Value, Error> {
-    let name = sel.name.as_ref().ok_or_else(|| Error::Selector("channels.create requires `name`".into()))?;
+pub fn channels_create(
+    client: &Client,
+    sel: &ChannelsCreateSelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let name = sel
+        .name
+        .as_ref()
+        .ok_or_else(|| Error::Selector("channels.create requires `name`".into()))?;
     let mut payload = json!({
         "name": name,
         "base_url": sel.base_url,
@@ -714,23 +780,53 @@ pub fn channels_create(client: &Client, sel: &ChannelsCreateSelector) -> Result<
     if let Some(obj) = payload.as_object_mut() {
         obj.retain(|_, v| !v.is_null());
     }
+    if !mode.is_apply() {
+        return Ok(dry_run_preview(
+            "POST",
+            "/api/channel/",
+            redact_body_secrets(payload),
+        ));
+    }
     let result = client.post("/api/channel/", Some(&payload))?;
     let data = data_object(&result);
     Ok(json!({
         "created": true,
+        "applied": true,
+        "dry_run": false,
         "channel": redact_channel(data),
     }))
 }
 
 /// `channels update`: PUT /api/channel/ with id + fields (PATCH semantics).
-pub fn channels_update(client: &Client, sel: &ChannelsUpdateSelector) -> Result<Value, Error> {
-    let id = sel.id.ok_or_else(|| Error::Selector("channels.update requires `id`".into()))?;
-    let fields = sel.fields.as_ref().ok_or_else(|| Error::Selector("channels.update requires `fields` (JSON object)".into()))?;
+pub fn channels_update(
+    client: &Client,
+    sel: &ChannelsUpdateSelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let id = sel
+        .id
+        .ok_or_else(|| Error::Selector("channels.update requires `id`".into()))?;
+    let fields = sel.fields.as_ref().ok_or_else(|| {
+        Error::Selector("channels.update requires `fields` (JSON object)".into())
+    })?;
     let mut payload = fields.clone();
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), json!(id));
         // NewAPI rejects status in PUT body; use channels status instead.
         obj.remove("status");
+    }
+    if !mode.is_apply() {
+        let before = client
+            .get(&format!("/api/channel/{id}"), &[])
+            .ok()
+            .map(|v| redact_channel(data_object(&v)));
+        let mut preview = dry_run_preview("PUT", "/api/channel/", redact_body_secrets(payload));
+        if let Some(obj) = preview.as_object_mut() {
+            if let Some(before) = before {
+                obj.insert("before".into(), before);
+            }
+        }
+        return Ok(preview);
     }
     client.put("/api/channel/", &payload)?;
     // Re-read the channel to show the result.
@@ -738,27 +834,45 @@ pub fn channels_update(client: &Client, sel: &ChannelsUpdateSelector) -> Result<
     let channel = data_object(&after);
     Ok(json!({
         "updated": true,
+        "applied": true,
+        "dry_run": false,
         "after": redact_channel(channel),
     }))
 }
 
 /// `channels status`: POST /api/channel/{id}/status.
-pub fn channels_status(client: &Client, sel: &ChannelsStatusSelector) -> Result<Value, Error> {
-    let id = sel.id.ok_or_else(|| Error::Selector("channels.status requires `id`".into()))?;
-    let status = sel.status.ok_or_else(|| Error::Selector("channels.status requires `status` (1=enabled, 2=disabled, 3=auto)".into()))?;
+pub fn channels_status(
+    client: &Client,
+    sel: &ChannelsStatusSelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let id = sel
+        .id
+        .ok_or_else(|| Error::Selector("channels.status requires `id`".into()))?;
+    let status = sel.status.ok_or_else(|| {
+        Error::Selector(
+            "channels.status requires `status` (1=enabled, 2=disabled, 3=auto)".into(),
+        )
+    })?;
     let path = format!("/api/channel/{id}/status");
     let body = json!({"status": status});
+    if !mode.is_apply() {
+        return Ok(dry_run_preview("POST", &path, body));
+    }
     client.post(&path, Some(&body))?;
     Ok(json!({
         "id": id,
         "status": status,
         "applied": true,
+        "dry_run": false,
     }))
 }
 
 /// `channels test`: GET /api/channel/test/{id}?model=...
 pub fn channels_test(client: &Client, sel: &ChannelsTestSelector) -> Result<Value, Error> {
-    let id = sel.id.ok_or_else(|| Error::Selector("channels.test requires `id`".into()))?;
+    let id = sel
+        .id
+        .ok_or_else(|| Error::Selector("channels.test requires `id`".into()))?;
     let path = format!("/api/channel/test/{id}");
     let mut query: Vec<(&str, String)> = Vec::new();
     if let Some(m) = &sel.model {
@@ -776,9 +890,17 @@ pub fn channels_test(client: &Client, sel: &ChannelsTestSelector) -> Result<Valu
 /// `options list`: GET /api/option/.
 pub fn options_list(client: &Client, sel: &OptionsListSelector) -> Result<Value, Error> {
     let data = client.get("/api/option/", &[])?;
-    let items = data.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    let items = data
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let filtered: Vec<Value> = if let Some(key) = &sel.key {
-        items.iter().filter(|item| item.get("key").and_then(Value::as_str) == Some(key.as_str())).cloned().collect()
+        items
+            .iter()
+            .filter(|item| item.get("key").and_then(Value::as_str) == Some(key.as_str()))
+            .cloned()
+            .collect()
     } else {
         items
     };
@@ -789,21 +911,42 @@ pub fn options_list(client: &Client, sel: &OptionsListSelector) -> Result<Value,
 }
 
 /// `options set`: PUT /api/option/ with {key, value}.
-pub fn options_set(client: &Client, sel: &OptionsSetSelector) -> Result<Value, Error> {
-    let key = sel.key.as_ref().ok_or_else(|| Error::Selector("options.set requires `key`".into()))?;
-    let value = sel.value.as_ref().ok_or_else(|| Error::Selector("options.set requires `value`".into()))?;
+pub fn options_set(
+    client: &Client,
+    sel: &OptionsSetSelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let key = sel
+        .key
+        .as_ref()
+        .ok_or_else(|| Error::Selector("options.set requires `key`".into()))?;
+    let value = sel
+        .value
+        .as_ref()
+        .ok_or_else(|| Error::Selector("options.set requires `value`".into()))?;
     let body = json!({"key": key, "value": value});
+    if !mode.is_apply() {
+        return Ok(dry_run_preview("PUT", "/api/option/", body));
+    }
     client.put("/api/option/", &body)?;
     Ok(json!({
         "key": key,
         "value": value,
         "applied": true,
+        "dry_run": false,
     }))
 }
 
 /// `tokens create`: POST /api/token/.
-pub fn tokens_create(client: &Client, sel: &TokensCreateSelector) -> Result<Value, Error> {
-    let name = sel.name.as_ref().ok_or_else(|| Error::Selector("tokens.create requires `name`".into()))?;
+pub fn tokens_create(
+    client: &Client,
+    sel: &TokensCreateSelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let name = sel
+        .name
+        .as_ref()
+        .ok_or_else(|| Error::Selector("tokens.create requires `name`".into()))?;
     let mut payload = json!({
         "name": name,
         "remain_quota": sel.remain_quota,
@@ -814,40 +957,73 @@ pub fn tokens_create(client: &Client, sel: &TokensCreateSelector) -> Result<Valu
     if let Some(obj) = payload.as_object_mut() {
         obj.retain(|_, v| !v.is_null());
     }
+    if !mode.is_apply() {
+        return Ok(dry_run_preview("POST", "/api/token/", payload));
+    }
     let result = client.post("/api/token/", Some(&payload))?;
     let data = data_object(&result);
     Ok(json!({
         "created": true,
+        "applied": true,
+        "dry_run": false,
         "token": redact_token(data),
     }))
 }
 
 /// `tokens update`: PUT /api/token/ with id + fields.
-pub fn tokens_update(client: &Client, sel: &TokensUpdateSelector) -> Result<Value, Error> {
-    let id = sel.id.ok_or_else(|| Error::Selector("tokens.update requires `id`".into()))?;
-    let fields = sel.fields.as_ref().ok_or_else(|| Error::Selector("tokens.update requires `fields` (JSON object)".into()))?;
+pub fn tokens_update(
+    client: &Client,
+    sel: &TokensUpdateSelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let id = sel
+        .id
+        .ok_or_else(|| Error::Selector("tokens.update requires `id`".into()))?;
+    let fields = sel.fields.as_ref().ok_or_else(|| {
+        Error::Selector("tokens.update requires `fields` (JSON object)".into())
+    })?;
     let mut payload = fields.clone();
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), json!(id));
+    }
+    if !mode.is_apply() {
+        return Ok(dry_run_preview("PUT", "/api/token/", payload));
     }
     client.put("/api/token/", &payload)?;
     let after = client.get(&format!("/api/token/{id}"), &[])?;
     let token = data_object(&after);
     Ok(json!({
         "updated": true,
+        "applied": true,
+        "dry_run": false,
         "after": redact_token(token),
     }))
 }
 
 /// `tokens key`: POST /api/token/{id}/key — regenerate and return raw key.
-pub fn tokens_key(client: &Client, sel: &TokensKeySelector) -> Result<Value, Error> {
-    let id = sel.id.ok_or_else(|| Error::Selector("tokens.key requires `id`".into()))?;
+pub fn tokens_key(
+    client: &Client,
+    sel: &TokensKeySelector,
+    mode: WriteMode,
+) -> Result<Value, Error> {
+    let id = sel
+        .id
+        .ok_or_else(|| Error::Selector("tokens.key requires `id`".into()))?;
     let path = format!("/api/token/{id}/key");
+    if !mode.is_apply() {
+        return Ok(dry_run_preview("POST", &path, json!({})));
+    }
     let result = client.post(&path, None)?;
-    let key = result.get("data").and_then(|d| d.get("key")).and_then(Value::as_str).unwrap_or("");
+    let key = result
+        .get("data")
+        .and_then(|d| d.get("key"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     Ok(json!({
         "id": id,
         "key": key,
+        "applied": true,
+        "dry_run": false,
         "note": "raw key returned; store in Sigil immediately",
     }))
 }
@@ -1086,6 +1262,43 @@ mod tests {
         let err = tokens_get(&untargetable_client(), &sel).unwrap_err();
         assert!(matches!(err, Error::Selector(_)));
     }
+
+
+    #[test]
+    fn write_mode_defaults_to_dry_run() {
+        assert_eq!(WriteMode::resolve(false, false), WriteMode::DryRun);
+        assert_eq!(WriteMode::resolve(true, false), WriteMode::Apply);
+        assert_eq!(WriteMode::resolve(true, true), WriteMode::DryRun);
+        assert_eq!(WriteMode::resolve(false, true), WriteMode::DryRun);
+    }
+
+    #[test]
+    fn channels_status_dry_run_issues_no_http() {
+        let sel = ChannelsStatusSelector {
+            id: Some(9),
+            status: Some(2),
+        };
+        let out = channels_status(&untargetable_client(), &sel, WriteMode::DryRun).unwrap();
+        assert_eq!(out["dry_run"], true);
+        assert_eq!(out["applied"], false);
+        assert_eq!(out["method"], "POST");
+        assert_eq!(out["path"], "/api/channel/9/status");
+    }
+
+    #[test]
+    fn channels_create_dry_run_redacts_key() {
+        let sel = ChannelsCreateSelector {
+            name: Some("demo".into()),
+            key: Some("sk-secret-key-material".into()),
+            ..Default::default()
+        };
+        let out = channels_create(&untargetable_client(), &sel, WriteMode::DryRun).unwrap();
+        assert_eq!(out["dry_run"], true);
+        assert_eq!(out["body"]["key"]["redacted"], true);
+        let s = out.to_string();
+        assert!(!s.contains("sk-secret-key-material"));
+    }
+
 
 
     #[test]

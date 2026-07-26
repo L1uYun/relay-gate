@@ -17,7 +17,7 @@ Rust CLI 已有：
 
 `Client` 已有 `get()` / `post()` / `put()` / `send_and_parse()` / `new_caller()`。
 
-选择器统一 `--input JSON`。写操作当前直接执行；**`--dry-run/--apply` 尚未实现**（计划原则保留，待补）。
+选择器统一 `--input JSON`。写操作默认 dry-run；`--apply` 落地；`--dry-run` 优先于 `--apply`（2026-07-26 已补）。
 
 redact 模块成熟，POST/PUT response 同样过 redact。
 
@@ -25,7 +25,7 @@ redact 模块成熟，POST/PUT response 同样过 redact。
 
 1. **只添加原子原语**：每个新增命令对应一个 NewAPI API endpoint 的一种 HTTP method，不做组合逻辑。
 2. **高层操作走拼接**：`channels maintain`、`channels optimize`、catalog 投影等复合操作不进 Rust，由 workflow / shell 调用原子原语拼接。
-3. **dry-run 是目标一等公民**：计划要求写原语默认 dry-run、`--apply` 才落地；**当前实现尚未补齐**，操作时先 get 再写。
+3. **dry-run 是一等公民**：写原语默认 dry-run，`--apply` 才落地；`--dry-run` 优先于 `--apply`。
 4. **secret 不泄露**：复用 redact 模块。
 
 ## Phase 1–3（已完成）
@@ -72,8 +72,7 @@ redact 模块成熟，POST/PUT response 同样过 redact。
 
 ## 后续（未开）
 
-1. 给写原语补 dry-run / apply 边界（对齐原设计原则）。
-2. 组合层 catalog 投影继续以 `models list` 为上游集合源，不要把复合逻辑塞回 Rust。
+1. 组合层 catalog 投影继续以 `models list` 为上游集合源，不要把复合逻辑塞回 Rust。
 3. 评估是否给 CPA 做独立原子 CLI（另开 contract），当前不进 relay-gate 主二进制。
 
 ## 验收记录
@@ -81,3 +80,4 @@ redact 模块成熟，POST/PUT response 同样过 redact。
 - Phase 1–3 代码：`c95c0dd` 一带入主线。
 - Live `relay-gate --output json schema`：`mutation_allowed=true`，18 ops。
 - 文档同步：2026-07-26（本回合）。
+
