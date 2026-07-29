@@ -42,10 +42,10 @@ Errors use the same envelope with `ok: false` and a redacted `error` object.
 | `schema` | `schema` | none |
 | `doctor` | `doctor` | none |
 | `channels list` | `channels.list` | `{"page":u32?,"page_size":u32?,"status":i32?,"type":i32?,"group":str?,"id_sort":bool?}` |
-| `channels get` | `channels.get` | `{"id":u64}` |
+| `channels get` | `channels.get` | `--id 40` or `{"id":u64}` |
 | `channels create` | `channels.create` | `{"name":str,"type":i32?,"base_url":str?,"key":str?,"models":str?,"group":str?,"priority":i32?,"weight":i32?}` |
-| `channels update` | `channels.update` | `{"id":u64,"fields":{...}}` PATCH semantics; do not put `status` here |
-| `channels status` | `channels.status` | `{"id":u64,"status":i32}` 1=enabled, 2=disabled, 3=auto |
+| `channels update` | `channels.update` | `--id 40 --set-models "a,b,c"` or `{"id":u64,"fields":{...}}` PATCH; no `status` |
+| `channels status` | `channels.status` | `--id 40 --status 1` or `{"id":u64,"status":i32}` 1=enabled, 2=disabled, 3=auto |
 | `channels test` | `channels.test` | `{"id":u64,"model":str?}` |
 | `tokens list` | `tokens.list` | `{"keyword":str?,"page":u32?,"page_size":u32?}` |
 | `tokens get` | `tokens.get` | `{"id":u64}` |
@@ -58,13 +58,15 @@ Errors use the same envelope with `ok: false` and a redacted `error` object.
 | `options set` | `options.set` | `{"key":str,"value":str}` |
 | `models list` | `models.list` | none; uses caller token |
 
-```sh
+```
+sh
 relay-gate schema
 relay-gate doctor
 relay-gate channels list --input '{"page":1,"page_size":10}'
-relay-gate channels get --input '{"id":7}'
-relay-gate channels status --input '{"id":7,"status":1}'
-relay-gate channels test --input '{"id":7,"model":"gpt-5.5"}'
+relay-gate channels get --id 7
+relay-gate channels update --id 7 --set-models "gpt-5.5,gpt-5.4" --apply
+relay-gate channels status --id 7 --status 1 --apply
+relay-gate channels test --id 7 --model "gpt-5.5"
 relay-gate tokens list --input '{"keyword":"codex"}'
 relay-gate options list
 relay-gate logs recent --input '{"page_size":20}'
@@ -72,6 +74,31 @@ relay-gate logs stats
 # models list needs RELAY_GATE_CALLER_TOKEN
 sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate --output json models list
 ```
+
+### Shorthand flags
+
+`channels get/update/status/test` support shorthand flags that merge into `--input` JSON (`--input` wins on conflict):
+
+| Command | Shorthand | Equivalent `--input` |
+|---|---|---|
+| `channels get` | `--id 40` | `{"id":40}` |
+| `channels update` | `--id 40 --set-models "a,b,c"` | `{"id":40,"fields":{"models":"a,b,c"}}` |
+| `channels update` | `--id 40 --set-status 1` | `{"id":40,"fields":{"status":1}}` (use `channels status` instead) |
+| `channels status` | `--id 40 --status 1` | `{"id":40,"status":1}` |
+| `channels test` | `--id 40 --model "gpt-5.5"` | `{"id":40,"model":"gpt-5.5"}` |
+
+### `rgate` PowerShell wrapper
+
+`scripts/rgate.ps1` provides a one-liner wrapper that auto-injects Sigil credentials:
+
+```powershell
+. D:\AgentWork\tools\relay-gate\scripts\rgate.ps1
+rgate doctor
+rgate channels update --id 40 --set-models "a,b,c" --apply
+rgate channels status --id 41 --status 1 --apply
+```
+
+Dot-sourced from `~/Documents/PowerShell/profile.ps1`.
 
 ## Credentials
 
@@ -137,4 +164,5 @@ cargo test
 ## License
 
 MIT
+
 
