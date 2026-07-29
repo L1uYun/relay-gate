@@ -1,7 +1,7 @@
 //! Discoverable command schema.
 //!
 //! [`build`] returns the static JSON description of the command surface.
-//! Operation names match the `operation` field emitted in the versioned
+//! Operation names match the ``operation`` field emitted in the versioned
 //! envelope, so a downstream agent can drive the CLI by first reading `schema`
 //! and then calling the listed operations.
 
@@ -34,9 +34,9 @@ pub fn build() -> Value {
             op("channels.list", "GET", "list channels (paginated)", Some(channels_list_selector())),
             op("channels.get", "GET", "get one channel by id", Some(channels_get_selector())),
             op("channels.create", "POST", "create a new channel (dry-run default; --apply to land)", Some(channels_create_selector())),
-            op("channels.update", "PUT", "update channel fields (PATCH semantics; dry-run default; --apply to land)", Some(channels_update_selector())),
-            op("channels.status", "POST", "set channel status (1=enabled, 2=disabled, 3=auto; dry-run default; --apply to land)", Some(channels_status_selector())),
-            op("channels.test", "GET", "test a channel by id", Some(channels_test_selector())),
+            op("channels.update", "PUT", "update channel fields (PATCH semantics; --id 40 --set-models ... or --input; dry-run; --apply)", Some(channels_update_selector())),
+            op("channels.status", "POST", "set channel status (--id 40 --status 1 or --input; dry-run; --apply)", Some(channels_status_selector())),
+            op("channels.test", "GET", "test channel (--id 40 --model gpt-5.5 or --input)", Some(channels_test_selector())),
             op("tokens.list", "GET", "list caller tokens", Some(tokens_list_selector())),
             op("tokens.get", "GET", "get one token by id", Some(tokens_get_selector())),
             op("tokens.create", "POST", "create a caller token (dry-run default; --apply to land)", Some(tokens_create_selector())),
@@ -97,24 +97,44 @@ fn channels_create_selector() -> Value {
 fn channels_update_selector() -> Value {
     json!({
         "type": "object",
-        "fields": {
-            "id": "u64",
-            "fields": "object (channel fields to update, excluding status)",
+        "shorthand": {
+            "--id": "u64 (channel id)",
+            "--set-models": "string (comma-separated model list)",
+            "--set-status": "i32 (1=enabled, 2=disabled)"
         },
+        "full": {
+            "id": "u64",
+            "fields": "object (channel fields to update, excluding status)"
+        },
+        "note": "Shorthand merges into --input JSON; --input wins on conflict. Use --input for full control."
     })
 }
 
 fn channels_status_selector() -> Value {
     json!({
         "type": "object",
-        "fields": { "id": "u64", "status": "i32 (1=enabled, 2=disabled, 3=auto)" },
+        "shorthand": {
+            "--id": "u64 (channel id)",
+            "--status": "i32 (1=enabled, 2=disabled, 3=auto)"
+        },
+        "full": {
+            "id": "u64",
+            "status": "i32 (1=enabled, 2=disabled, 3=auto)"
+        }
     })
 }
 
 fn channels_test_selector() -> Value {
     json!({
         "type": "object",
-        "fields": { "id": "u64", "model": "string?" },
+        "shorthand": {
+            "--id": "u64 (channel id)",
+            "--model": "string (model name to probe)"
+        },
+        "full": {
+            "id": "u64",
+            "model": "string?"
+        }
     })
 }
 

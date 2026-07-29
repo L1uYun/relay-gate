@@ -13,6 +13,7 @@ use relay_gate::{
     schema,
 };
 use serde::de::DeserializeOwned;
+use serde_json::json;
 use serde_json::Value;
 
 #[derive(Parser, Debug)]
@@ -88,10 +89,13 @@ enum ChannelsAction {
         #[arg(long)]
         input: Option<String>,
     },
-    /// Get a single channel by id.
+    /// Get a single channel by id (--id 40 or --input '{"id":40}').
     Get {
+        #[arg(long, short = 'i')]
+        id: Option<u64>,
+        /// JSON input: {"id":40}
         #[arg(long)]
-        input: String,
+        input: Option<String>,
     },
     /// Create a new channel.
     Create {
@@ -99,19 +103,42 @@ enum ChannelsAction {
         input: String,
     },
     /// Update channel fields (PATCH semantics; body = id + fields).
+    /// Supports shorthand: --id 40 --set-models "a,b,c" --set-status 1
+    /// Shorthand flags merge into ``input`` JSON; ``input`` wins on conflict.
     Update {
+        #[arg(long, short = 'i')]
+        id: Option<u64>,
+        /// Comma-separated model list shorthand.
         #[arg(long)]
-        input: String,
+        set_models: Option<String>,
+        /// Enable (1) / disable (2) channel shorthand.
+        #[arg(long)]
+        set_status: Option<i32>,
+        /// JSON input (full control).
+        #[arg(long)]
+        input: Option<String>,
     },
     /// Set channel status (1=enabled, 2=disabled, 3=auto-disabled).
     Status {
+        #[arg(long, short = 'i')]
+        id: Option<u64>,
+        /// New status: 1=enabled, 2=disabled, 3=auto.
+        #[arg(long, short = 's')]
+        status: Option<i32>,
+        /// JSON input: {"id":40,"status":1}
         #[arg(long)]
-        input: String,
+        input: Option<String>,
     },
     /// Test a channel by id.
     Test {
+        #[arg(long, short = 'i')]
+        id: Option<u64>,
+        /// Model to probe.
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+        /// JSON input: {"id":40,"model":"gpt-5.5"}
         #[arg(long)]
-        input: String,
+        input: Option<String>,
     },
 }
 
@@ -260,24 +287,29 @@ fn execute(cmd: &Command, client: &Client, write_mode: WriteMode) -> Result<Valu
                 let sel: ChannelsListSelector = parse_selector(input.as_deref())?;
                 relay_gate::channels_list(client, &sel)
             }
-            ChannelsAction::Get { input } => {
-                let sel: ChannelsGetSelector = parse_selector(Some(input.as_str()))?;
+            ChannelsAction::Get { id, input } => {
+                let merged = merge_get_input(*id, input.as_deref())?;
+                let sel: ChannelsGetSelector = parse_selector(Some(&merged))?;
                 relay_gate::channels_get(client, &sel)
             }
             ChannelsAction::Create { input } => {
                 let sel: ChannelsCreateSelector = parse_selector(Some(input.as_str()))?;
                 relay_gate::channels_create(client, &sel, write_mode)
             }
-            ChannelsAction::Update { input } => {
-                let sel: ChannelsUpdateSelector = parse_selector(Some(input.as_str()))?;
+            ChannelsAction::Update { id, set_models, set_status, input } => {
+                // Merge shorthand flags into input JSON. Input wins on conflict.
+                let merged = merge_update_input(*id, set_models.as_deref(), *set_status, input.as_deref())?;
+                let sel: ChannelsUpdateSelector = parse_selector(Some(&merged))?;
                 relay_gate::channels_update(client, &sel, write_mode)
             }
-            ChannelsAction::Status { input } => {
-                let sel: ChannelsStatusSelector = parse_selector(Some(input.as_str()))?;
+            ChannelsAction::Status { id, status, input } => {
+                let merged = merge_status_input(*id, *status, input.as_deref())?;
+                let sel: ChannelsStatusSelector = parse_selector(Some(&merged))?;
                 relay_gate::channels_status(client, &sel, write_mode)
             }
-            ChannelsAction::Test { input } => {
-                let sel: ChannelsTestSelector = parse_selector(Some(input.as_str()))?;
+            ChannelsAction::Test { id, model, input } => {
+                let merged = merge_test_input(*id, model.as_deref(), input.as_deref())?;
+                let sel: ChannelsTestSelector = parse_selector(Some(&merged))?;
                 relay_gate::channels_test(client, &sel)
             }
         },
@@ -330,6 +362,108 @@ fn execute(cmd: &Command, client: &Client, write_mode: WriteMode) -> Result<Valu
             }
         },
     }
+}
+
+/// Build merged update input JSON from shorthand flags + optional ``--input``.
+/// Input wins on conflict (its values override the shorthand).
+fn merge_update_input(id: Option<u64>, set_models: Option<&str>, set_status: Option<i32>, input: Option<&str>) -> Result<String, Error> {
+    let mut base = match input {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(s)
+            .map_err(|e| Error::Selector(format!("invalid --input JSON: {e}")))?,
+        _ => json!({}),
+    };
+    let obj = base.as_object_mut().ok_or_else(|| {
+        Error::Selector("--input must be a JSON object".into())
+    })?;
+
+    if obj.get("id").is_none() {
+        if let Some(v) = id {
+            obj.insert("id".into(), json!(v));
+        }
+    }
+    // set_models goes into fields.models
+    if let Some(models_str) = set_models {
+        let fields = obj.entry("fields").or_insert_with(|| json!({}));
+        if let Some(f_obj) = fields.as_object_mut() {
+            if f_obj.get("models").is_none() {
+                f_obj.insert("models".into(), json!(models_str));
+            }
+        }
+    }
+    // set_status goes into fields.status
+    if let Some(st) = set_status {
+        let fields = obj.entry("fields").or_insert_with(|| json!({}));
+        if let Some(f_obj) = fields.as_object_mut() {
+            if f_obj.get("status").is_none() {
+                f_obj.insert("status".into(), json!(st));
+            }
+        }
+    }
+    serde_json::to_string(&base).map_err(|e| Error::Selector(format!("merge failed: {e}")))
+}
+
+/// Build merged status input JSON.
+fn merge_status_input(id: Option<u64>, status: Option<i32>, input: Option<&str>) -> Result<String, Error> {
+    let mut base = match input {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(s)
+            .map_err(|e| Error::Selector(format!("invalid --input JSON: {e}")))?,
+        _ => json!({}),
+    };
+    let obj = base.as_object_mut().ok_or_else(|| {
+        Error::Selector("--input must be a JSON object".into())
+    })?;
+    if obj.get("id").is_none() {
+        if let Some(v) = id {
+            obj.insert("id".into(), json!(v));
+        }
+    }
+    if obj.get("status").is_none() {
+        if let Some(v) = status {
+            obj.insert("status".into(), json!(v));
+        }
+    }
+    serde_json::to_string(&base).map_err(|e| Error::Selector(format!("merge failed: {e}")))
+}
+
+/// Build merged test input JSON.
+fn merge_test_input(id: Option<u64>, model: Option<&str>, input: Option<&str>) -> Result<String, Error> {
+    let mut base = match input {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(s)
+            .map_err(|e| Error::Selector(format!("invalid --input JSON: {e}")))?,
+        _ => json!({}),
+    };
+    let obj = base.as_object_mut().ok_or_else(|| {
+        Error::Selector("--input must be a JSON object".into())
+    })?;
+    if obj.get("id").is_none() {
+        if let Some(v) = id {
+            obj.insert("id".into(), json!(v));
+        }
+    }
+    if obj.get("model").is_none() {
+        if let Some(v) = model {
+            obj.insert("model".into(), json!(v));
+        }
+    }
+    serde_json::to_string(&base).map_err(|e| Error::Selector(format!("merge failed: {e}")))
+}
+
+/// Build merged get input JSON.
+fn merge_get_input(id: Option<u64>, input: Option<&str>) -> Result<String, Error> {
+    let mut base = match input {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(s)
+            .map_err(|e| Error::Selector(format!("invalid --input JSON: {e}")))?,
+        _ => json!({}),
+    };
+    let obj = base.as_object_mut().ok_or_else(|| {
+        Error::Selector("--input must be a JSON object".into())
+    })?;
+    if obj.get("id").is_none() {
+        if let Some(v) = id {
+            obj.insert("id".into(), json!(v));
+        }
+    }
+    serde_json::to_string(&base).map_err(|e| Error::Selector(format!("merge failed: {e}")))
 }
 
 fn parse_selector<T: DeserializeOwned + Default>(input: Option<&str>) -> Result<T, Error> {
@@ -411,3 +545,5 @@ fn summary_data(data: &Value) -> String {
     }
     parts.join(" ")
 }
+
+
