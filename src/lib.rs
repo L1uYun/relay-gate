@@ -987,7 +987,16 @@ pub fn tokens_update(
         obj.insert("id".to_string(), json!(id));
     }
     if !mode.is_apply() {
-        return Ok(dry_run_preview("PUT", "/api/token/", payload));
+        // PATCH preview: show current state so the change is auditable before landing.
+        let mut preview = dry_run_preview("PUT", "/api/token/", payload);
+        let before = client
+            .get(&format!("/api/token/{id}"), &[])
+            .ok()
+            .map(|d| redact_token(data_object(&d)));
+        if let (Some(b), Some(o)) = (before, preview.as_object_mut()) {
+            o.insert("before".to_string(), b);
+        }
+        return Ok(preview);
     }
     client.put("/api/token/", &payload)?;
     let after = client.get(&format!("/api/token/{id}"), &[])?;

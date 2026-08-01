@@ -159,10 +159,33 @@ enum TokensAction {
         #[arg(long)]
         input: String,
     },
-    /// Update token fields.
+    /// Update token fields (PATCH semantics; body = id + fields).
+    /// Supports shorthand: --id 3 --set-name "my token" --set-quota 10000
+    /// Shorthand flags merge into ``input`` JSON; ``input`` wins on conflict.
     Update {
+        #[arg(long, short = 'i')]
+        id: Option<u64>,
+        /// Token display name shorthand.
         #[arg(long)]
-        input: String,
+        set_name: Option<String>,
+        /// Remaining quota (bytes) shorthand.
+        #[arg(long)]
+        set_quota: Option<u64>,
+        /// Unlimited quota shorthand (1/true = unlimited).
+        #[arg(long)]
+        set_unlimited: Option<bool>,
+        /// Expiry Unix seconds shorthand (0 = never).
+        #[arg(long)]
+        set_expired: Option<i64>,
+        /// Access group shorthand (comma-separated).
+        #[arg(long)]
+        set_group: Option<String>,
+        /// Allowed source IPs shorthand (comma-separated).
+        #[arg(long)]
+        set_allow_ips: Option<String>,
+        /// JSON input (full control).
+        #[arg(long)]
+        input: Option<String>,
     },
     /// Regenerate token key.
     Key {
@@ -326,8 +349,27 @@ fn execute(cmd: &Command, client: &Client, write_mode: WriteMode) -> Result<Valu
                 let sel: TokensCreateSelector = parse_selector(Some(input.as_str()))?;
                 relay_gate::tokens_create(client, &sel, write_mode)
             }
-            TokensAction::Update { input } => {
-                let sel: TokensUpdateSelector = parse_selector(Some(input.as_str()))?;
+            TokensAction::Update {
+                id,
+                set_name,
+                set_quota,
+                set_unlimited,
+                set_expired,
+                set_group,
+                set_allow_ips,
+                input,
+            } => {
+                let merged = merge_tokens_update_input(
+                    *id,
+                    set_name.as_deref(),
+                    *set_quota,
+                    *set_unlimited,
+                    *set_expired,
+                    set_group.as_deref(),
+                    set_allow_ips.as_deref(),
+                    input.as_deref(),
+                )?;
+                let sel: TokensUpdateSelector = parse_selector(Some(&merged))?;
                 relay_gate::tokens_update(client, &sel, write_mode)
             }
             TokensAction::Key { input } => {
@@ -402,7 +444,53 @@ fn merge_update_input(id: Option<u64>, set_models: Option<&str>, set_status: Opt
     serde_json::to_string(&base).map_err(|e| Error::Selector(format!("merge failed: {e}")))
 }
 
-/// Build merged status input JSON.
+/// Build merged tokens.update input JSON from shorthand flags + optional ``--input``.
+/// Input wins on conflict (its values override the shorthand).
+fn merge_tokens_update_input(
+    id: Option<u64>,
+    set_name: Option<&str>,
+    set_quota: Option<u64>,
+    set_unlimited: Option<bool>,
+    set_expired: Option<i64>,
+    set_group: Option<&str>,
+    set_allow_ips: Option<&str>,
+    input: Option<&str>,
+) -> Result<String, Error> {
+    let mut base = match input {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(s)
+            .map_err(|e| Error::Selector(format!("invalid --input JSON: {e}")))?,
+        _ => json!({}),
+    };
+    let obj = base.as_object_mut().ok_or_else(|| {
+        Error::Selector("--input must be a JSON object".into())
+    })?;
+    if obj.get("id").is_none() {
+        if let Some(v) = id {
+            obj.insert("id".into(), json!(v));
+        }
+    }
+    // Shorthand flags go into fields.<key>, only when not already present.
+    let mut shorthand: Vec<(&'static str, Option<Value>)> = vec![
+        ("name", set_name.map(Value::from)),
+        ("remain_quota", set_quota.map(Value::from)),
+        ("unlimited_quota", set_unlimited.map(Value::from)),
+        ("expired_time", set_expired.map(Value::from)),
+        ("group", set_group.map(Value::from)),
+        ("allow_ips", set_allow_ips.map(Value::from)),
+    ];
+    shorthand.retain(|(_, v)| v.is_some());
+    if !shorthand.is_empty() {
+        let fields = obj.entry("fields").or_insert_with(|| json!({}));
+        if let Some(f_obj) = fields.as_object_mut() {
+            for (key, value) in shorthand {
+                if f_obj.get(key).is_none() {
+                    f_obj.insert(key.to_string(), value.unwrap());
+                }
+            }
+        }
+    }
+    serde_json::to_string(&base).map_err(|e| Error::Selector(format!("merge failed: {e}")))
+}
 fn merge_status_input(id: Option<u64>, status: Option<i32>, input: Option<&str>) -> Result<String, Error> {
     let mut base = match input {
         Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(s)
