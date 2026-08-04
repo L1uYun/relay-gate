@@ -68,7 +68,7 @@ redact 模块成熟，POST/PUT response 同样过 redact。
 | `tokens ensure-self` | create + key + Sigil | 原子 tokens.* + sigil 手工 |
 | `codex-catalog sync/task` | 多文件投影 + Windows 任务 | `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` + `models list` |
 | `agent-models sync` | 多消费者投影 | 同上 / `scripts/sync-codebuddy-models.ps1` |
-| `cliproxy *` | CPA 管理面 | `scripts/cliproxy_mgmt.py` |
+| `cliproxy *` | CPA 管理面（独立 companion module，不在 Rust binary） | `scripts/cliproxy_mgmt.py` |
 
 ## 后续（未开）
 

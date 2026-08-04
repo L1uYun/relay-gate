@@ -1,9 +1,9 @@
 # CLIProxyAPI (CPA) Management
 
-> **2026-07-26 事实**：CPA 管理面当前由 `D:\AgentWork\tools\relay-gate\scripts\cliproxy_mgmt.py` 承载，**不是** Rust `relay-gate` 子命令。下文若写 `relay-gate cliproxy ...`，按该 Python 管理脚本理解，直到另开 CPA 原子 CLI contract。
+> **2026-08-04 事实**：CPA 管理面当前由 `D:\AgentWork\tools\relay-gate\scripts\cliproxy_mgmt.py` 承载，**不是** Rust `relay-gate` 子命令。下文若写 `relay-gate cliproxy ...`，按该 Python 管理脚本理解，直到另开 CPA 原子 CLI contract。当前实测 `relay-gate --help` 不含 `cliproxy`；下方命令表是管理 API contract，不代表当前 Rust binary 可直接执行。
 
 Owner: `D:\AgentWork\tools\relay-gate`
-Live instance: `xiaolab-japan` docker `cli-proxy-api` (`eceasy/cli-proxy-api:v7.2.91`)
+Live instance: `xiaolab-japan` docker `cli-proxy-api` (`eceasy/cli-proxy-api:v7.2.111`)
 Bind: host `127.0.0.1:8317` only (not public)
 Management secret: Sigil `cliproxy-mgmt-key` (config stores bcrypt under `remote-management.secret-key`)
 Caller API key for NewAPI upstream: Sigil `cliproxy-api-key` / `cpa-api-key`
@@ -29,7 +29,7 @@ ssh -N -L 18317:127.0.0.1:8317 xiaolab-japan
 relay-gate cliproxy --transport direct --cliproxy-base-url http://127.0.0.1:18317 doctor
 ```
 
-Auth header: `Authorization: Bearer <mgmt-key>` (raw key also accepted by v7.2.73).
+Auth header: `Authorization: Bearer <mgmt-key>`.
 
 Do not put the management key in shell history, docs, or git. Use Sigil only.
 
@@ -55,7 +55,7 @@ CPA management UI (`/static/management.html`) drives provider OAuth:
 
 Operators should complete browser OAuth via the management UI or vendor CLI, then verify with `relay-gate cliproxy auth-files list`. This CLI does not automate browser login.
 
-## Management UI route inventory (v7.2.73 SPA)
+## Management UI route inventory (v7.2.111 SPA)
 
 Verified from container `/CLIProxyAPI/static/management.html`:
 
@@ -96,3 +96,28 @@ Do not reuse broad account tokens for routine DNS/tunnel edits when a narrower c
 
 - NewAPI channel inventory: relay-gate skill `references/channels-and-models.md`
 - NewAPI admin CLI remains the default `relay-gate channels|tokens|logs|...` surface
+
+## Codex auth-file import
+
+The live CPA v7.2.111 management UI uploads JSON credentials with:
+
+- `POST /v0/management/auth-files`
+- multipart form field: `file`
+- filename: any `.json` name; a `codex-...json` name is recommended for operator clarity
+
+A Codex CLI `auth.json` wrapper is not the CPA Codex schema. Convert the fields before upload:
+
+| Codex CLI wrapper | CPA Codex auth file |
+|---|---|
+| `tokens.id_token` | `id_token` |
+| `tokens.access_token` | `access_token` |
+| `tokens.refresh_token` | `refresh_token` |
+| `tokens.account_id` | `account_id` |
+| `last_refresh` | `last_refresh` |
+| `_meta.email` | `email` |
+| access-token JWT `exp` as RFC3339 | `expired` |
+| fixed value | `type: "codex"` |
+
+Do not keep the nested `tokens` wrapper as the only token location. After upload, verify `GET /v0/management/auth-files` reports `provider=codex`, `type=codex`, and `status=active`; then run a real `/v1/responses` probe. HTTP 200 from the upload endpoint alone is not sufficient.
+
+Never place auth-file contents, access tokens, refresh tokens, or account identifiers in docs, shell history, or Git. If a token file has been pasted into a chat or otherwise exposed, revoke/re-authorize it after validation.

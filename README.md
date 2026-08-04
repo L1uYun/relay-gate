@@ -130,7 +130,7 @@ Prefer `sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate ...` so secrets
 |---|---|
 | Codex/Codex++/Pi/CodeBuddy catalog projection | `D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1` |
 | CodeBuddy sync helper | `scripts/sync-codebuddy-models.ps1` |
-| CPA / cliproxy management | `scripts/cliproxy_mgmt.py` + `docs/cliproxy-management.md` |
+| CPA / cliproxy management | companion module `scripts/cliproxy_mgmt.py` + `docs/cliproxy-management.md` (not exposed by the current Rust binary) |
 | Remote maintain timer | `xiaolab-japan:/opt/newapi-maintainer` (Python, remote-only) |
 | `channels maintain/optimize`, `codex-catalog *`, `agent-models *` | retired composite CLI surface |
 
