@@ -2,7 +2,7 @@
 
 Agent-native Rust CLI for the NewAPI gateway at `https://newapi.l1uyun.top:8080`.
 
-Canonical binary: `D:\AgentWork\state\relay-gate\bin\relay-gate.exe` (also on `PATH` via cargo bin).
+Canonical binary: `relay-gate` (installed in `D:\AgentWork\state\cargo\home\bin`, on `PATH`).
 
 As of 2026-07-26 this CLI is **not read-only**. `schema` reports `mutation_allowed: true` and 18 atomic operations. Composite workflows (catalog projection, maintain/optimize, CPA management) stay outside this binary.
 
@@ -18,7 +18,7 @@ Rust 2024 edition (rustc 1.85+). Keep build state on `D:`:
 
 ```sh
 CARGO_HOME=D:/AgentWork/state/cargo/home \
-CARGO_TARGET_DIR=D:/AgentWork/state/cargo/targets/relay-gate-rust-305 \
+CARGO_TARGET_DIR=D:/AgentWork/state/cargo/targets/relay-gate \
 cargo build --release
 ```
 
@@ -157,12 +157,10 @@ The raw credential is never echoed in stdout, arguments, or diagnostics:
 
 ```sh
 CARGO_HOME=D:/AgentWork/state/cargo/home \
-CARGO_TARGET_DIR=D:/AgentWork/state/cargo/targets/relay-gate-rust-305 \
+CARGO_TARGET_DIR=D:/AgentWork/state/cargo/targets/relay-gate \
 cargo test
 ```
 
 ## License
 
 MIT
-
-

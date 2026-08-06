@@ -9,7 +9,6 @@
 #   rgate channels update --input '{"id":40,"fields":{"models":"..."}}' --apply  # full JSON still works
 function rgate {
     $env:SIGIL_PASSPHRASE = [Environment]::GetEnvironmentVariable('SIGIL_PASSPHRASE','User')
-    $exe = "D:\AgentWork\state\relay-gate\bin\relay-gate.exe"
-    sigil exec SIGIL_ADMIN_TOKEN --apply -- $exe @args
+    sigil exec SIGIL_ADMIN_TOKEN --apply -- relay-gate @args
 }
 #endregion

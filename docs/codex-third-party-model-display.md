@@ -135,7 +135,7 @@ config.toml/catalog/auth 三个文件 Codex++ 会自动写进 `~/.codex/`（和 
 - Codex catalog：`C:\Users\84618\.codex\cc-switch-model-catalog.json`
 - Codex auth：`C:\Users\84618\.codex\auth.json`
 - Codex models_cache：`C:\Users\84618\.codex\models_cache.json`
-- relay-gate CLI：`D:\AgentWork\state\relay-gate\bin\relay-gate.exe`（源码 `D:\AgentWork\tools\relay-gate\`，Rust）
+- relay-gate CLI：`relay-gate`（源码 `D:\AgentWork\tools\relay-gate\`，Rust；唯一安装点 `D:\AgentWork\state\cargo\home\bin`）
 - 上游模型集合：`sigil exec RELAY_GATE_CALLER_TOKEN --apply -- relay-gate --output json models list`
 - 本地目录投影：`pwsh -File D:\AgentWork\scripts\refresh-codex-model-menu-cache.ps1 -Once`
 - CodeBuddy 单独投影：`D:\AgentWork\tools\relay-gate\scripts\sync-codebuddy-models.ps1`
@@ -199,4 +199,3 @@ ws.close()
 
 如果 `available_models` 含第三方模型且 `codexPlusMarks` 非空，说明 Codex++ 注入生效。
 如果 `available_models` 只有官方 5 个且 `codexPlusMarks` 为空，说明只有 cc-switch/手动配置，菜单不会显示第三方模型。
-
